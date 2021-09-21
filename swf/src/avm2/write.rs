@@ -1,3 +1,5 @@
+#![allow(clippy::unusual_byte_groupings)]
+
 use crate::avm2::opcode::OpCode;
 use crate::avm2::types::*;
 use crate::string::SwfStr;
@@ -63,8 +65,8 @@ impl<W: Write> SwfWriteExt for Writer<W> {
 }
 
 impl<W: Write> Writer<W> {
-    pub fn new(output: W) -> Writer<W> {
-        Writer { output }
+    pub fn new(output: W) -> Self {
+        Self { output }
     }
 
     pub fn write(&mut self, abc_file: AbcFile) -> Result<()> {
@@ -124,13 +126,10 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn write_i24(&mut self, n: i32) -> Result<()> {
-        // TODO: Verify n fits in 24-bits.
-        self.write_u8(((n >> 16) & 0xff) as u8)?;
-        self.write_u8(((n >> 8) & 0xff) as u8)?;
-        self.write_u8((n & 0xff) as u8)?;
-        Ok(())
+        let bytes = n.to_le_bytes();
+        debug_assert!(bytes[3] == 0 || bytes[3] == 0xFF);
+        self.output.write_all(&bytes[..3])
     }
 
     fn write_i32(&mut self, n: i32) -> Result<()> {
@@ -311,6 +310,18 @@ impl<W: Write> Writer<W> {
             Multiname::MultinameLA { ref namespace_set } => {
                 self.write_u8(0x1c)?;
                 self.write_index(namespace_set)?;
+            }
+            Multiname::TypeName {
+                ref base_type,
+                ref parameters,
+            } => {
+                self.write_u8(0x1d)?;
+                self.write_index(base_type)?;
+                self.write_u30(parameters.len() as u32)?;
+
+                for param in parameters {
+                    self.write_index(param)?;
+                }
             }
         }
         Ok(())
@@ -592,6 +603,10 @@ impl<W: Write> Writer<W> {
         match *op {
             Op::Add => self.write_opcode(OpCode::Add)?,
             Op::AddI => self.write_opcode(OpCode::AddI)?,
+            Op::ApplyType { num_types } => {
+                self.write_opcode(OpCode::ApplyType)?;
+                self.write_u30(num_types)?;
+            }
             Op::AsType { ref type_name } => {
                 self.write_opcode(OpCode::AsType)?;
                 self.write_index(type_name)?;
@@ -601,6 +616,11 @@ impl<W: Write> Writer<W> {
             Op::BitNot => self.write_opcode(OpCode::BitNot)?,
             Op::BitOr => self.write_opcode(OpCode::BitOr)?,
             Op::BitXor => self.write_opcode(OpCode::BitXor)?,
+            Op::Bkpt => self.write_opcode(OpCode::Bkpt)?,
+            Op::BkptLine { line_num } => {
+                self.write_opcode(OpCode::BkptLine)?;
+                self.write_u30(line_num)?;
+            }
             Op::Call { num_args } => {
                 self.write_opcode(OpCode::Call)?;
                 self.write_u30(num_args)?;
@@ -667,7 +687,12 @@ impl<W: Write> Writer<W> {
                 self.write_index(index)?;
             }
             Op::CoerceA => self.write_opcode(OpCode::CoerceA)?,
+            Op::CoerceB => self.write_opcode(OpCode::CoerceB)?,
+            Op::CoerceD => self.write_opcode(OpCode::CoerceD)?,
+            Op::CoerceI => self.write_opcode(OpCode::CoerceI)?,
+            Op::CoerceO => self.write_opcode(OpCode::CoerceO)?,
             Op::CoerceS => self.write_opcode(OpCode::CoerceS)?,
+            Op::CoerceU => self.write_opcode(OpCode::CoerceU)?,
             Op::Construct { num_args } => {
                 self.write_opcode(OpCode::Construct)?;
                 self.write_u30(num_args)?;
@@ -733,6 +758,10 @@ impl<W: Write> Writer<W> {
             Op::Equals => self.write_opcode(OpCode::Equals)?,
             Op::EscXAttr => self.write_opcode(OpCode::EscXAttr)?,
             Op::EscXElem => self.write_opcode(OpCode::EscXElem)?,
+            Op::FindDef { ref index } => {
+                self.write_opcode(OpCode::FindDef)?;
+                self.write_index(index)?;
+            }
             Op::FindProperty { ref index } => {
                 self.write_opcode(OpCode::FindProperty)?;
                 self.write_index(index)?;
@@ -764,6 +793,10 @@ impl<W: Write> Writer<W> {
                     self.write_u30(index)?;
                 }
             },
+            Op::GetOuterScope { index } => {
+                self.write_opcode(OpCode::GetOuterScope)?;
+                self.write_u30(index)?;
+            }
             Op::GetProperty { ref index } => {
                 self.write_opcode(OpCode::GetProperty)?;
                 self.write_index(index)?;
@@ -932,6 +965,10 @@ impl<W: Write> Writer<W> {
                 self.write_opcode(OpCode::PushByte)?;
                 self.write_u8(value)?;
             }
+            Op::PushConstant { value } => {
+                self.write_opcode(OpCode::PushConstant)?;
+                self.write_u30(value)?;
+            }
             Op::PushDouble { ref value } => {
                 self.write_opcode(OpCode::PushDouble)?;
                 self.write_index(value)?;
@@ -1005,6 +1042,7 @@ impl<W: Write> Writer<W> {
             Op::Sxi16 => self.write_opcode(OpCode::Sxi16)?,
             Op::Sxi8 => self.write_opcode(OpCode::Sxi8)?,
             Op::Throw => self.write_opcode(OpCode::Throw)?,
+            Op::Timestamp => self.write_opcode(OpCode::Timestamp)?,
             Op::TypeOf => self.write_opcode(OpCode::TypeOf)?,
             Op::URShift => self.write_opcode(OpCode::URShift)?,
         };
@@ -1038,5 +1076,22 @@ pub mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn write_i24() {
+        let write = |n: i32| {
+            let mut out = vec![];
+            {
+                let mut writer = Writer::new(&mut out);
+                writer.write_i24(n).unwrap();
+            }
+            out
+        };
+
+        assert_eq!(write(0), &[0, 0, 0]);
+        assert_eq!(write(2), &[2, 0, 0]);
+        assert_eq!(write(77777), &[0b1101_0001, 0b0010_1111, 0b0000_0001]);
+        assert_eq!(write(-77777), &[0b0010_1111, 0b1101_0000, 0b1111_1110]);
     }
 }

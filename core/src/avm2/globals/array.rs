@@ -3,13 +3,12 @@
 use crate::avm2::activation::Activation;
 use crate::avm2::array::ArrayStorage;
 use crate::avm2::class::Class;
-use crate::avm2::method::Method;
-use crate::avm2::names::{Multiname, Namespace, QName};
-use crate::avm2::object::{ArrayObject, Object, TObject};
-use crate::avm2::string::AvmString;
-use crate::avm2::traits::Trait;
+use crate::avm2::method::{Method, NativeMethodImpl};
+use crate::avm2::names::{Namespace, QName};
+use crate::avm2::object::{array_allocator, ArrayObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
+use crate::string::AvmString;
 use bitflags::bitflags;
 use gc_arena::{GcCell, MutationContext};
 use std::cmp::{min, Ordering};
@@ -97,18 +96,7 @@ pub fn build_array<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     array: ArrayStorage<'gc>,
 ) -> Result<Value<'gc>, Error> {
-    Ok(ArrayObject::from_array(
-        array,
-        activation
-            .context
-            .avm2
-            .system_prototypes
-            .as_ref()
-            .map(|sp| sp.array)
-            .unwrap(),
-        activation.context.gc_context,
-    )
-    .into())
+    Ok(ArrayObject::from_storage(activation, array)?.into())
 }
 
 /// Implements `Array.concat`
@@ -142,7 +130,7 @@ pub fn resolve_array_hole<'gc>(
 ) -> Result<Value<'gc>, Error> {
     item.map(Ok).unwrap_or_else(|| {
         this.proto()
-            .map(|mut p| {
+            .map(|p| {
                 p.get_property(
                     p,
                     &QName::new(
@@ -225,7 +213,7 @@ pub fn to_locale_string<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error> {
     join_inner(act, this, &[",".into()], |v, activation| {
-        let mut o = v.coerce_to_object(activation)?;
+        let o = v.coerce_to_object(activation)?;
 
         let tls = o.get_property(
             o,
@@ -265,17 +253,27 @@ pub fn value_of<'gc>(
 /// mutate the array under iteration. Normally, holding an `Iterator` on the
 /// array while this happens would cause a panic; this code exists to prevent
 /// that.
-struct ArrayIter<'gc> {
+pub struct ArrayIter<'gc> {
     array_object: Object<'gc>,
-    index: u32,
-    length: u32,
+    pub index: u32,
+    pub rev_index: u32,
 }
 
 impl<'gc> ArrayIter<'gc> {
     /// Construct a new `ArrayIter`.
     pub fn new(
         activation: &mut Activation<'_, 'gc, '_>,
-        mut array_object: Object<'gc>,
+        array_object: Object<'gc>,
+    ) -> Result<Self, Error> {
+        Self::with_bounds(activation, array_object, 0, u32::MAX)
+    }
+
+    /// Construct a new `ArrayIter` that is bounded to a given range.
+    pub fn with_bounds(
+        activation: &mut Activation<'_, 'gc, '_>,
+        array_object: Object<'gc>,
+        start_index: u32,
+        end_index: u32,
     ) -> Result<Self, Error> {
         let length = array_object
             .get_property(
@@ -287,23 +285,53 @@ impl<'gc> ArrayIter<'gc> {
 
         Ok(Self {
             array_object,
-            index: 0,
-            length,
+            index: start_index.min(length),
+            rev_index: end_index.saturating_add(1).min(length),
         })
     }
 
-    /// Get the next item in the array.
+    /// Get the next item from the front of the array
     ///
     /// Since this isn't a real iterator, this comes pre-enumerated; it yields
     /// a pair of the index and then the value.
-    fn next(
+    pub fn next(
         &mut self,
         activation: &mut Activation<'_, 'gc, '_>,
     ) -> Option<Result<(u32, Value<'gc>), Error>> {
-        if self.index < self.length {
+        if self.index < self.rev_index {
             let i = self.index;
 
             self.index += 1;
+
+            Some(
+                self.array_object
+                    .get_property(
+                        self.array_object,
+                        &QName::new(
+                            Namespace::public(),
+                            AvmString::new(activation.context.gc_context, i.to_string()),
+                        ),
+                        activation,
+                    )
+                    .map(|val| (i, val)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Get the next item from the back of the array.
+    ///
+    /// Since this isn't a real iterator, this comes pre-enumerated; it yields
+    /// a pair of the index and then the value.
+    pub fn next_back(
+        &mut self,
+        activation: &mut Activation<'_, 'gc, '_>,
+    ) -> Option<Result<(u32, Value<'gc>), Error>> {
+        if self.index < self.rev_index {
+            self.rev_index -= 1;
+
+            let i = self.rev_index;
 
             Some(
                 self.array_object
@@ -458,13 +486,12 @@ pub fn every<'gc>(
             .unwrap_or(Value::Null)
             .coerce_to_object(activation)
             .ok();
-        let mut is_every = true;
         let mut iter = ArrayIter::new(activation, this)?;
 
         while let Some(r) = iter.next(activation) {
             let (i, item) = r?;
 
-            is_every &= callback
+            let result = callback
                 .call(
                     receiver,
                     &[item, i.into(), this.into()],
@@ -472,9 +499,13 @@ pub fn every<'gc>(
                     receiver.and_then(|r| r.proto()),
                 )?
                 .coerce_to_boolean();
+
+            if !result {
+                return Ok(false.into());
+            }
         }
 
-        return Ok(is_every.into());
+        return Ok(true.into());
     }
 
     Ok(Value::Undefined)
@@ -498,13 +529,12 @@ pub fn some<'gc>(
             .unwrap_or(Value::Null)
             .coerce_to_object(activation)
             .ok();
-        let mut is_some = false;
         let mut iter = ArrayIter::new(activation, this)?;
 
         while let Some(r) = iter.next(activation) {
             let (i, item) = r?;
 
-            is_some |= callback
+            let result = callback
                 .call(
                     receiver,
                     &[item, i.into(), this.into()],
@@ -512,9 +542,13 @@ pub fn some<'gc>(
                     receiver.and_then(|r| r.proto()),
                 )?
                 .coerce_to_boolean();
+
+            if result {
+                return Ok(true.into());
+            }
         }
 
-        return Ok(is_some.into());
+        return Ok(false.into());
     }
 
     Ok(Value::Undefined)
@@ -688,9 +722,10 @@ pub fn resolve_index<'gc>(
     let index = index.coerce_to_i32(activation)?;
 
     Ok(if index < 0 {
-        (length as isize).saturating_add(index as isize) as usize
+        let offset = index as isize;
+        length.saturating_sub((-offset) as usize)
     } else {
-        index as usize
+        (index as usize).min(length)
     })
 }
 
@@ -753,37 +788,32 @@ pub fn splice<'gc>(
                     .unwrap_or_else(|| array_length.into())
                     .coerce_to_i32(activation)?;
 
-                let mut removed_array = ArrayStorage::new(0);
-                if delete_count > 0 {
-                    let actual_end = min(array_length, actual_start + delete_count as usize);
-                    let args_slice = if args.len() > 2 {
-                        args[2..].iter().cloned()
-                    } else {
-                        [].iter().cloned()
-                    };
+                let actual_end = min(array_length, actual_start + delete_count as usize);
+                let args_slice = if args.len() > 2 {
+                    args[2..].iter().cloned()
+                } else {
+                    [].iter().cloned()
+                };
 
-                    let contents = this
-                        .as_array_storage()
-                        .map(|a| a.iter().collect::<Vec<Option<Value<'gc>>>>())
-                        .unwrap();
-                    let mut resolved = Vec::new();
+                let contents = this
+                    .as_array_storage()
+                    .map(|a| a.iter().collect::<Vec<Option<Value<'gc>>>>())
+                    .unwrap();
 
-                    for (i, v) in contents.iter().enumerate() {
-                        resolved.push(resolve_array_hole(activation, this, i, v.clone())?);
-                    }
+                let mut resolved = Vec::with_capacity(contents.len());
+                for (i, v) in contents.iter().enumerate() {
+                    resolved.push(resolve_array_hole(activation, this, i, v.clone())?);
+                }
 
-                    let removed = resolved
-                        .splice(actual_start..actual_end, args_slice)
-                        .collect::<Vec<Value<'gc>>>();
-                    removed_array = ArrayStorage::from_args(&removed[..]);
+                let removed = resolved
+                    .splice(actual_start..actual_end, args_slice)
+                    .collect::<Vec<Value<'gc>>>();
+                let removed_array = ArrayStorage::from_args(&removed[..]);
 
-                    let mut resolved_array = ArrayStorage::from_args(&resolved[..]);
+                let mut resolved_array = ArrayStorage::from_args(&resolved[..]);
 
-                    if let Some(mut array) =
-                        this.as_array_storage_mut(activation.context.gc_context)
-                    {
-                        swap(&mut *array, &mut resolved_array)
-                    }
+                if let Some(mut array) = this.as_array_storage_mut(activation.context.gc_context) {
+                    swap(&mut *array, &mut resolved_array)
                 }
 
                 return build_array(activation, removed_array);
@@ -798,7 +828,7 @@ bitflags! {
     /// The array options that a given sort operation may use.
     ///
     /// These are provided as a number by the VM and converted into bitflags.
-    struct SortOptions: u8 {
+    pub struct SortOptions: u8 {
         /// Request case-insensitive string value sort.
         const CASE_INSENSITIVE     = 1 << 0;
 
@@ -882,7 +912,7 @@ where
     Ok(!options.contains(SortOptions::UNIQUE_SORT) || unique_sort_satisfied)
 }
 
-fn compare_string_case_sensitive<'gc>(
+pub fn compare_string_case_sensitive<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     a: Value<'gc>,
     b: Value<'gc>,
@@ -893,7 +923,7 @@ fn compare_string_case_sensitive<'gc>(
     Ok(string_a.cmp(&string_b))
 }
 
-fn compare_string_case_insensitive<'gc>(
+pub fn compare_string_case_insensitive<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     a: Value<'gc>,
     b: Value<'gc>,
@@ -904,7 +934,7 @@ fn compare_string_case_insensitive<'gc>(
     Ok(string_a.cmp(&string_b))
 }
 
-fn compare_numeric<'gc>(
+pub fn compare_numeric<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     a: Value<'gc>,
     b: Value<'gc>,
@@ -941,15 +971,18 @@ fn sort_postprocess<'gc>(
             );
         } else {
             if let Some(mut old_array) = this.as_array_storage_mut(activation.context.gc_context) {
-                let mut new_vec = Vec::new();
-
-                for (src, v) in values.iter() {
-                    if old_array.get(*src).is_none() && !matches!(v, Value::Undefined) {
-                        new_vec.push(Some(v.clone()));
-                    } else {
-                        new_vec.push(old_array.get(*src).clone());
-                    }
-                }
+                let new_vec = values
+                    .iter()
+                    .map(|(src, v)| {
+                        if let Some(old_value) = old_array.get(*src) {
+                            Some(old_value)
+                        } else if !matches!(v, Value::Undefined) {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
 
                 let mut new_array = ArrayStorage::from_storage(new_vec);
 
@@ -973,13 +1006,7 @@ fn extract_array_values<'gc>(
     let object = value.coerce_to_object(activation).ok();
     let holey_vec = if let Some(object) = object {
         if let Some(field_array) = object.as_array_storage() {
-            let mut array = Vec::new();
-
-            for v in field_array.iter() {
-                array.push(v);
-            }
-
-            array
+            field_array.clone()
         } else {
             return Ok(None);
         }
@@ -987,7 +1014,7 @@ fn extract_array_values<'gc>(
         return Ok(None);
     };
 
-    let mut unholey_vec = Vec::new();
+    let mut unholey_vec = Vec::with_capacity(holey_vec.length());
     for (i, v) in holey_vec.iter().enumerate() {
         unholey_vec.push(resolve_array_hole(
             activation,
@@ -1109,12 +1136,12 @@ fn extract_maybe_array_strings<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     value: Value<'gc>,
 ) -> Result<Vec<AvmString<'gc>>, Error> {
-    let mut out = Vec::new();
+    let values = extract_maybe_array_values(activation, value)?;
 
-    for value in extract_maybe_array_values(activation, value)? {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
         out.push(value.coerce_to_string(activation)?);
     }
-
     Ok(out)
 }
 
@@ -1128,14 +1155,14 @@ fn extract_maybe_array_sort_options<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     value: Value<'gc>,
 ) -> Result<Vec<SortOptions>, Error> {
-    let mut out = Vec::new();
+    let values = extract_maybe_array_values(activation, value)?;
 
-    for value in extract_maybe_array_values(activation, value)? {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
         out.push(SortOptions::from_bits_truncate(
             value.coerce_to_u32(activation)? as u8,
         ));
     }
-
     Ok(out)
 }
 
@@ -1178,14 +1205,14 @@ pub fn sort_on<'gc>(
                 first_option,
                 constrain(|activation, a, b| {
                     for (field_name, options) in field_names.iter().zip(options.iter()) {
-                        let mut a_object = a.coerce_to_object(activation)?;
+                        let a_object = a.coerce_to_object(activation)?;
                         let a_field = a_object.get_property(
                             a_object,
                             &QName::new(Namespace::public(), *field_name),
                             activation,
                         )?;
 
-                        let mut b_object = b.coerce_to_object(activation)?;
+                        let b_object = b.coerce_to_object(activation)?;
                         let b_field = b_object.get_property(
                             b_object,
                             &QName::new(Namespace::public(), *field_name),
@@ -1227,154 +1254,65 @@ pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>
     let class = Class::new(
         QName::new(Namespace::public(), "Array"),
         Some(QName::new(Namespace::public(), "Object").into()),
-        Method::from_builtin(instance_init),
-        Method::from_builtin(class_init),
+        Method::from_builtin(instance_init, "<Array instance initializer>", mc),
+        Method::from_builtin(class_init, "<Array class initializer>", mc),
         mc,
     );
 
-    class.write(mc).define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "length"),
-        Method::from_builtin(length),
-    ));
-    class.write(mc).define_instance_trait(Trait::from_setter(
-        QName::new(Namespace::public(), "length"),
-        Method::from_builtin(set_length),
-    ));
+    let mut write = class.write(mc);
 
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "concat"),
-        Method::from_builtin(concat),
-    ));
+    write.set_instance_allocator(array_allocator);
 
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "join"),
-        Method::from_builtin(join),
-    ));
+    const PUBLIC_INSTANCE_METHODS: &[(&str, NativeMethodImpl)] = &[
+        ("toString", to_string),
+        ("toLocaleString", to_locale_string),
+        ("valueOf", value_of),
+    ];
+    write.define_public_builtin_instance_methods(mc, PUBLIC_INSTANCE_METHODS);
 
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "toString"),
-        Method::from_builtin(to_string),
-    ));
+    const PUBLIC_INSTANCE_PROPERTIES: &[(
+        &str,
+        Option<NativeMethodImpl>,
+        Option<NativeMethodImpl>,
+    )] = &[("length", Some(length), Some(set_length))];
+    write.define_public_builtin_instance_properties(mc, PUBLIC_INSTANCE_PROPERTIES);
 
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "toLocaleString"),
-        Method::from_builtin(to_locale_string),
-    ));
+    const AS3_INSTANCE_METHODS: &[(&str, NativeMethodImpl)] = &[
+        ("concat", concat),
+        ("join", join),
+        ("forEach", for_each),
+        ("map", map),
+        ("filter", filter),
+        ("every", every),
+        ("some", some),
+        ("indexOf", index_of),
+        ("lastIndexOf", last_index_of),
+        ("pop", pop),
+        ("push", push),
+        ("reverse", reverse),
+        ("shift", shift),
+        ("unshift", unshift),
+        ("slice", slice),
+        ("splice", splice),
+        ("sort", sort),
+        ("sortOn", sort_on),
+    ];
+    write.define_as3_builtin_instance_methods(mc, AS3_INSTANCE_METHODS);
 
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "valueOf"),
-        Method::from_builtin(value_of),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "forEach"),
-        Method::from_builtin(for_each),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "map"),
-        Method::from_builtin(map),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "filter"),
-        Method::from_builtin(filter),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "every"),
-        Method::from_builtin(every),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "some"),
-        Method::from_builtin(some),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "indexOf"),
-        Method::from_builtin(index_of),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "lastIndexOf"),
-        Method::from_builtin(last_index_of),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "pop"),
-        Method::from_builtin(pop),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "push"),
-        Method::from_builtin(push),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "reverse"),
-        Method::from_builtin(reverse),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "shift"),
-        Method::from_builtin(shift),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "unshift"),
-        Method::from_builtin(unshift),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "slice"),
-        Method::from_builtin(slice),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "splice"),
-        Method::from_builtin(splice),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "sort"),
-        Method::from_builtin(sort),
-    ));
-
-    class.write(mc).define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "sortOn"),
-        Method::from_builtin(sort_on),
-    ));
-
-    class.write(mc).define_class_trait(Trait::from_const(
-        QName::new(Namespace::public(), "CASEINSENSITIVE"),
-        Multiname::from(QName::new(Namespace::public(), "uint")),
-        Some(SortOptions::CASE_INSENSITIVE.bits().into()),
-    ));
-
-    class.write(mc).define_class_trait(Trait::from_const(
-        QName::new(Namespace::public(), "DESCENDING"),
-        Multiname::from(QName::new(Namespace::public(), "uint")),
-        Some(SortOptions::DESCENDING.bits().into()),
-    ));
-
-    class.write(mc).define_class_trait(Trait::from_const(
-        QName::new(Namespace::public(), "NUMERIC"),
-        Multiname::from(QName::new(Namespace::public(), "uint")),
-        Some(SortOptions::NUMERIC.bits().into()),
-    ));
-
-    class.write(mc).define_class_trait(Trait::from_const(
-        QName::new(Namespace::public(), "RETURNINDEXEDARRAY"),
-        Multiname::from(QName::new(Namespace::public(), "uint")),
-        Some(SortOptions::RETURN_INDEXED_ARRAY.bits().into()),
-    ));
-
-    class.write(mc).define_class_trait(Trait::from_const(
-        QName::new(Namespace::public(), "UNIQUESORT"),
-        Multiname::from(QName::new(Namespace::public(), "uint")),
-        Some(SortOptions::UNIQUE_SORT.bits().into()),
-    ));
+    const CONSTANTS: &[(&str, u32)] = &[
+        (
+            "CASEINSENSITIVE",
+            SortOptions::CASE_INSENSITIVE.bits() as u32,
+        ),
+        ("DESCENDING", SortOptions::DESCENDING.bits() as u32),
+        ("NUMERIC", SortOptions::NUMERIC.bits() as u32),
+        (
+            "RETURNINDEXEDARRAY",
+            SortOptions::RETURN_INDEXED_ARRAY.bits() as u32,
+        ),
+        ("UNIQUESORT", SortOptions::UNIQUE_SORT.bits() as u32),
+    ];
+    write.define_public_constant_uint_class_traits(CONSTANTS);
 
     class
 }

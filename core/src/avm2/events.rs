@@ -3,10 +3,10 @@
 use crate::avm2::activation::Activation;
 use crate::avm2::names::{Namespace, QName};
 use crate::avm2::object::{Object, TObject};
-use crate::avm2::string::AvmString;
 use crate::avm2::value::Value;
 use crate::avm2::Error;
 use crate::display_object::TDisplayObject;
+use crate::string::AvmString;
 use gc_arena::Collect;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -32,13 +32,13 @@ pub enum EventPhase {
 #[collect(require_static)]
 pub enum PropagationMode {
     /// Propagate events normally.
-    AllowPropagation,
+    Allow,
 
     /// Stop capturing or bubbling events.
-    StopPropagation,
+    Stop,
 
     /// Stop running event handlers altogether.
-    StopImmediatePropagation,
+    StopImmediate,
 }
 
 /// Represents data fields of an event that can be fired on an object that
@@ -83,7 +83,7 @@ impl<'gc> Event<'gc> {
             bubbles: false,
             cancelable: false,
             cancelled: false,
-            propagation: PropagationMode::AllowPropagation,
+            propagation: PropagationMode::Allow,
             current_target: None,
             event_phase: EventPhase::AtTarget,
             target: None,
@@ -129,21 +129,21 @@ impl<'gc> Event<'gc> {
     }
 
     pub fn is_propagation_stopped(&self) -> bool {
-        self.propagation != PropagationMode::AllowPropagation
+        self.propagation != PropagationMode::Allow
     }
 
     pub fn stop_propagation(&mut self) {
-        if self.propagation != PropagationMode::StopImmediatePropagation {
-            self.propagation = PropagationMode::StopPropagation;
+        if self.propagation != PropagationMode::StopImmediate {
+            self.propagation = PropagationMode::Stop;
         }
     }
 
     pub fn is_propagation_stopped_immediately(&self) -> bool {
-        self.propagation == PropagationMode::StopImmediatePropagation
+        self.propagation == PropagationMode::StopImmediate
     }
 
     pub fn stop_immediate_propagation(&mut self) {
-        self.propagation = PropagationMode::StopImmediatePropagation;
+        self.propagation = PropagationMode::StopImmediate;
     }
 
     pub fn phase(&self) -> EventPhase {
@@ -362,7 +362,7 @@ pub fn parent_of(target: Object<'_>) -> Option<Object<'_>> {
 /// call the wrong handlers.
 pub fn dispatch_event_to_target<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
-    mut target: Object<'gc>,
+    target: Object<'gc>,
     event: Object<'gc>,
 ) -> Result<(), Error> {
     avm_debug!(
@@ -422,7 +422,7 @@ pub fn dispatch_event_to_target<'gc>(
 
 pub fn dispatch_event<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
-    mut this: Object<'gc>,
+    this: Object<'gc>,
     event: Object<'gc>,
 ) -> Result<bool, Error> {
     let target = this

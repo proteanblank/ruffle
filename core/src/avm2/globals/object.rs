@@ -2,10 +2,10 @@
 
 use crate::avm2::activation::Activation;
 use crate::avm2::class::Class;
-use crate::avm2::method::Method;
+use crate::avm2::method::{Method, NativeMethodImpl};
 use crate::avm2::names::{Namespace, QName};
-use crate::avm2::object::{FunctionObject, Object, ScriptObject, TObject};
-use crate::avm2::scope::Scope;
+use crate::avm2::object::{FunctionObject, Object, TObject};
+use crate::avm2::traits::Trait;
 use crate::avm2::value::Value;
 use crate::avm2::Error;
 use gc_arena::{GcCell, MutationContext};
@@ -21,10 +21,99 @@ pub fn instance_init<'gc>(
 
 /// Implements `Object`'s class initializer
 pub fn class_init<'gc>(
-    _activation: &mut Activation<'_, 'gc, '_>,
-    _this: Option<Object<'gc>>,
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error> {
+    if let Some(this) = this {
+        let mut object_proto = this
+            .get_property(this, &QName::dynamic_name("prototype"), activation)?
+            .coerce_to_object(activation)?;
+        let gc_context = activation.context.gc_context;
+
+        object_proto.install_dynamic_property(
+            gc_context,
+            QName::new(Namespace::public(), "hasOwnProperty"),
+            FunctionObject::from_method(
+                activation,
+                Method::from_builtin(has_own_property, "hasOwnProperty", gc_context),
+                None,
+                None,
+            )
+            .into(),
+        )?;
+        object_proto.install_dynamic_property(
+            gc_context,
+            QName::new(Namespace::public(), "propertyIsEnumerable"),
+            FunctionObject::from_method(
+                activation,
+                Method::from_builtin(property_is_enumerable, "propertyIsEnumerable", gc_context),
+                None,
+                None,
+            )
+            .into(),
+        )?;
+        object_proto.install_dynamic_property(
+            gc_context,
+            QName::new(Namespace::public(), "setPropertyIsEnumerable"),
+            FunctionObject::from_method(
+                activation,
+                Method::from_builtin(
+                    set_property_is_enumerable,
+                    "setPropertyIsEnumerable",
+                    gc_context,
+                ),
+                None,
+                None,
+            )
+            .into(),
+        )?;
+        object_proto.install_dynamic_property(
+            gc_context,
+            QName::new(Namespace::public(), "isPrototypeOf"),
+            FunctionObject::from_method(
+                activation,
+                Method::from_builtin(is_prototype_of, "isPrototypeOf", gc_context),
+                None,
+                None,
+            )
+            .into(),
+        )?;
+        object_proto.install_dynamic_property(
+            gc_context,
+            QName::new(Namespace::public(), "toString"),
+            FunctionObject::from_method(
+                activation,
+                Method::from_builtin(to_string, "toString", gc_context),
+                None,
+                None,
+            )
+            .into(),
+        )?;
+        object_proto.install_dynamic_property(
+            gc_context,
+            QName::new(Namespace::public(), "toLocaleString"),
+            FunctionObject::from_method(
+                activation,
+                Method::from_builtin(to_locale_string, "toLocaleString", gc_context),
+                None,
+                None,
+            )
+            .into(),
+        )?;
+        object_proto.install_dynamic_property(
+            gc_context,
+            QName::new(Namespace::public(), "valueOf"),
+            FunctionObject::from_method(
+                activation,
+                Method::from_builtin(value_of, "valueOf", gc_context),
+                None,
+                None,
+            )
+            .into(),
+        )?;
+    }
+
     Ok(Value::Undefined)
 }
 
@@ -149,86 +238,30 @@ pub fn set_property_is_enumerable<'gc>(
     Ok(Value::Undefined)
 }
 
-/// Create object prototype.
-///
-/// This function creates a suitable class and object prototype attached to it,
-/// but does not actually fill it with methods. That requires a valid function
-/// prototype, and is thus done by `fill_proto` below.
-pub fn create_proto<'gc>(
-    activation: &mut Activation<'_, 'gc, '_>,
-    globals: Object<'gc>,
-) -> (Object<'gc>, GcCell<'gc, Class<'gc>>) {
+/// Construct `Object`'s class.
+pub fn create_class<'gc>(gc_context: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>> {
     let object_class = Class::new(
         QName::new(Namespace::public(), "Object"),
         None,
-        Method::from_builtin(instance_init),
-        Method::from_builtin(class_init),
-        activation.context.gc_context,
+        Method::from_builtin(instance_init, "<Object instance initializer>", gc_context),
+        Method::from_builtin(class_init, "<Object class initializer>", gc_context),
+        gc_context,
     );
+    let mut write = object_class.write(gc_context);
 
-    let scope = Scope::push_scope(globals.get_scope(), globals, activation.context.gc_context);
-    let proto =
-        ScriptObject::bare_prototype(activation.context.gc_context, object_class, Some(scope));
+    write.define_class_trait(Trait::from_const(
+        QName::new(Namespace::public(), "length"),
+        QName::new(Namespace::public(), "int").into(),
+        None,
+    ));
 
-    (proto, object_class)
-}
+    // Fixed traits (in AS3 namespace)
+    const PUBLIC_INSTANCE_METHODS: &[(&str, NativeMethodImpl)] = &[
+        ("hasOwnProperty", has_own_property),
+        ("isPrototypeOf", is_prototype_of),
+        ("propertyIsEnumerable", property_is_enumerable),
+    ];
+    write.define_as3_builtin_instance_methods(gc_context, PUBLIC_INSTANCE_METHODS);
 
-/// Finish constructing `Object.prototype`, and also construct `Object`.
-///
-/// `__proto__` and other cross-linked properties of this object will *not*
-/// be defined here. The caller of this function is responsible for linking
-/// them in order to obtain a valid ECMAScript `Object` prototype.
-///
-/// Since Object and Function are so heavily intertwined, this function does
-/// not allocate an object to store either proto. Instead, you must allocate
-/// bare objects for both and let this function fill Object for you.
-pub fn fill_proto<'gc>(
-    gc_context: MutationContext<'gc, '_>,
-    mut object_proto: Object<'gc>,
-    fn_proto: Object<'gc>,
-) -> Object<'gc> {
-    object_proto.install_method(
-        gc_context,
-        QName::new(Namespace::public(), "toString"),
-        0,
-        FunctionObject::from_builtin(gc_context, to_string, fn_proto),
-    );
-    object_proto.install_method(
-        gc_context,
-        QName::new(Namespace::public(), "toLocaleString"),
-        0,
-        FunctionObject::from_builtin(gc_context, to_locale_string, fn_proto),
-    );
-    object_proto.install_method(
-        gc_context,
-        QName::new(Namespace::public(), "valueOf"),
-        0,
-        FunctionObject::from_builtin(gc_context, value_of, fn_proto),
-    );
-    object_proto.install_method(
-        gc_context,
-        QName::new(Namespace::as3_namespace(), "hasOwnProperty"),
-        0,
-        FunctionObject::from_builtin(gc_context, has_own_property, fn_proto),
-    );
-    object_proto.install_method(
-        gc_context,
-        QName::new(Namespace::as3_namespace(), "isPrototypeOf"),
-        0,
-        FunctionObject::from_builtin(gc_context, is_prototype_of, fn_proto),
-    );
-    object_proto.install_method(
-        gc_context,
-        QName::new(Namespace::as3_namespace(), "propertyIsEnumerable"),
-        0,
-        FunctionObject::from_builtin(gc_context, property_is_enumerable, fn_proto),
-    );
-    object_proto.install_method(
-        gc_context,
-        QName::new(Namespace::public(), "setPropertyIsEnumerable"),
-        0,
-        FunctionObject::from_builtin(gc_context, set_property_is_enumerable, fn_proto),
-    );
-
-    FunctionObject::from_builtin_constr(gc_context, instance_init, object_proto, fn_proto).unwrap()
+    object_class
 }

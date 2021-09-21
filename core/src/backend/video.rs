@@ -28,8 +28,15 @@ pub struct EncodedFrame<'a> {
 impl<'a> EncodedFrame<'a> {
     /// Borrow this frame's data.
     pub fn data(&'a self) -> &'a [u8] {
-        &self.data
+        self.data
     }
+}
+
+/// A decoded frame of video in RGBA format.
+struct DecodedFrame {
+    width: u16,
+    height: u16,
+    rgba: Vec<u8>,
 }
 
 /// What dependencies a given video frame has on any previous frames.
@@ -108,6 +115,9 @@ pub trait VideoBackend {
     /// `RenderBackend`. `VideoBackend` implementations are allowed to return
     /// an error if a drawable bitmap cannot be produced for the given
     /// renderer.
+    ///
+    /// Any previously returned bitmaps may be updated, invalidated, or
+    /// reclaimed by whatever means the decoder implementation chooses.
     fn decode_video_stream_frame(
         &mut self,
         stream: VideoStreamHandle,

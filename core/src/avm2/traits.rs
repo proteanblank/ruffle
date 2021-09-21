@@ -1,14 +1,14 @@
 //! Active trait definitions
 
+use crate::avm2::activation::Activation;
 use crate::avm2::class::Class;
 use crate::avm2::method::Method;
 use crate::avm2::names::{Multiname, QName};
 use crate::avm2::script::TranslationUnit;
 use crate::avm2::value::{abc_default_value, Value};
-use crate::avm2::{Avm2, Error};
-use crate::collect::CollectWrapper;
+use crate::avm2::Error;
 use bitflags::bitflags;
-use gc_arena::{Collect, GcCell, MutationContext};
+use gc_arena::{Collect, GcCell};
 use swf::avm2::types::{Trait as AbcTrait, TraitKind as AbcTraitKind};
 
 bitflags! {
@@ -41,17 +41,18 @@ pub struct Trait<'gc> {
     name: QName<'gc>,
 
     /// The attributes set on this trait.
-    attributes: CollectWrapper<TraitAttributes>,
+    #[collect(require_static)]
+    attributes: TraitAttributes,
 
     /// The kind of trait in use.
     kind: TraitKind<'gc>,
 }
 
-fn trait_attribs_from_abc_traits(abc_trait: &AbcTrait) -> CollectWrapper<TraitAttributes> {
+fn trait_attribs_from_abc_traits(abc_trait: &AbcTrait) -> TraitAttributes {
     let mut attributes = TraitAttributes::empty();
     attributes.set(TraitAttributes::FINAL, abc_trait.is_final);
     attributes.set(TraitAttributes::OVERRIDE, abc_trait.is_override);
-    CollectWrapper(attributes)
+    attributes
 }
 
 /// The fields for a particular kind of trait.
@@ -103,7 +104,7 @@ impl<'gc> Trait<'gc> {
 
         Trait {
             name,
-            attributes: CollectWrapper(TraitAttributes::empty()),
+            attributes: TraitAttributes::empty(),
             kind: TraitKind::Class { slot_id: 0, class },
         }
     }
@@ -111,7 +112,7 @@ impl<'gc> Trait<'gc> {
     pub fn from_method(name: QName<'gc>, method: Method<'gc>) -> Self {
         Trait {
             name,
-            attributes: CollectWrapper(TraitAttributes::empty()),
+            attributes: TraitAttributes::empty(),
             kind: TraitKind::Method { disp_id: 0, method },
         }
     }
@@ -119,7 +120,7 @@ impl<'gc> Trait<'gc> {
     pub fn from_getter(name: QName<'gc>, method: Method<'gc>) -> Self {
         Trait {
             name,
-            attributes: CollectWrapper(TraitAttributes::empty()),
+            attributes: TraitAttributes::empty(),
             kind: TraitKind::Getter { disp_id: 0, method },
         }
     }
@@ -127,7 +128,7 @@ impl<'gc> Trait<'gc> {
     pub fn from_setter(name: QName<'gc>, method: Method<'gc>) -> Self {
         Trait {
             name,
-            attributes: CollectWrapper(TraitAttributes::empty()),
+            attributes: TraitAttributes::empty(),
             kind: TraitKind::Setter { disp_id: 0, method },
         }
     }
@@ -135,7 +136,7 @@ impl<'gc> Trait<'gc> {
     pub fn from_function(name: QName<'gc>, function: Method<'gc>) -> Self {
         Trait {
             name,
-            attributes: CollectWrapper(TraitAttributes::empty()),
+            attributes: TraitAttributes::empty(),
             kind: TraitKind::Function {
                 slot_id: 0,
                 function,
@@ -150,7 +151,7 @@ impl<'gc> Trait<'gc> {
     ) -> Self {
         Trait {
             name,
-            attributes: CollectWrapper(TraitAttributes::empty()),
+            attributes: TraitAttributes::empty(),
             kind: TraitKind::Slot {
                 slot_id: 0,
                 type_name,
@@ -166,7 +167,7 @@ impl<'gc> Trait<'gc> {
     ) -> Self {
         Trait {
             name,
-            attributes: CollectWrapper(TraitAttributes::empty()),
+            attributes: TraitAttributes::empty(),
             kind: TraitKind::Slot {
                 slot_id: 0,
                 type_name,
@@ -179,9 +180,9 @@ impl<'gc> Trait<'gc> {
     pub fn from_abc_trait(
         unit: TranslationUnit<'gc>,
         abc_trait: &AbcTrait,
-        avm2: &mut Avm2<'gc>,
-        mc: MutationContext<'gc, '_>,
+        activation: &mut Activation<'_, 'gc, '_>,
     ) -> Result<Self, Error> {
+        let mc = activation.context.gc_context;
         let name = QName::from_abc_multiname(unit, abc_trait.name.clone(), mc)?;
 
         Ok(match &abc_trait.kind {
@@ -200,7 +201,7 @@ impl<'gc> Trait<'gc> {
                         Multiname::from_abc_multiname_static(unit, type_name.clone(), mc)?
                     },
                     default_value: if let Some(dv) = value {
-                        Some(abc_default_value(unit, &dv, avm2, mc)?)
+                        Some(abc_default_value(unit, dv, activation)?)
                     } else {
                         None
                     },
@@ -211,7 +212,7 @@ impl<'gc> Trait<'gc> {
                 attributes: trait_attribs_from_abc_traits(abc_trait),
                 kind: TraitKind::Method {
                     disp_id: *disp_id,
-                    method: unit.load_method(method.0, mc)?,
+                    method: unit.load_method(method.0, false, activation)?,
                 },
             },
             AbcTraitKind::Getter { disp_id, method } => Trait {
@@ -219,7 +220,7 @@ impl<'gc> Trait<'gc> {
                 attributes: trait_attribs_from_abc_traits(abc_trait),
                 kind: TraitKind::Getter {
                     disp_id: *disp_id,
-                    method: unit.load_method(method.0, mc)?,
+                    method: unit.load_method(method.0, false, activation)?,
                 },
             },
             AbcTraitKind::Setter { disp_id, method } => Trait {
@@ -227,7 +228,7 @@ impl<'gc> Trait<'gc> {
                 attributes: trait_attribs_from_abc_traits(abc_trait),
                 kind: TraitKind::Setter {
                     disp_id: *disp_id,
-                    method: unit.load_method(method.0, mc)?,
+                    method: unit.load_method(method.0, false, activation)?,
                 },
             },
             AbcTraitKind::Class { slot_id, class } => Trait {
@@ -235,7 +236,7 @@ impl<'gc> Trait<'gc> {
                 attributes: trait_attribs_from_abc_traits(abc_trait),
                 kind: TraitKind::Class {
                     slot_id: *slot_id,
-                    class: unit.load_class(class.0, avm2, mc)?,
+                    class: unit.load_class(class.0, activation)?,
                 },
             },
             AbcTraitKind::Function { slot_id, function } => Trait {
@@ -243,7 +244,7 @@ impl<'gc> Trait<'gc> {
                 attributes: trait_attribs_from_abc_traits(abc_trait),
                 kind: TraitKind::Function {
                     slot_id: *slot_id,
-                    function: unit.load_method(function.0, mc)?,
+                    function: unit.load_method(function.0, true, activation)?,
                 },
             },
             AbcTraitKind::Const {
@@ -261,7 +262,7 @@ impl<'gc> Trait<'gc> {
                         Multiname::from_abc_multiname_static(unit, type_name.clone(), mc)?
                     },
                     default_value: if let Some(dv) = value {
-                        Some(abc_default_value(unit, &dv, avm2, mc)?)
+                        Some(abc_default_value(unit, dv, activation)?)
                     } else {
                         None
                     },
@@ -279,15 +280,22 @@ impl<'gc> Trait<'gc> {
     }
 
     pub fn is_final(&self) -> bool {
-        self.attributes.0.contains(TraitAttributes::FINAL)
+        self.attributes.contains(TraitAttributes::FINAL)
     }
 
     pub fn is_override(&self) -> bool {
-        self.attributes.0.contains(TraitAttributes::OVERRIDE)
+        self.attributes.contains(TraitAttributes::OVERRIDE)
     }
 
     pub fn set_attributes(&mut self, attribs: TraitAttributes) {
-        self.attributes.0 = attribs;
+        self.attributes = attribs;
+    }
+
+    /// Convenience chaining method that adds the override flag to a trait.
+    pub fn with_override(mut self) -> Self {
+        self.attributes |= TraitAttributes::OVERRIDE;
+
+        self
     }
 
     /// Set the slot or dispatch ID of this trait.

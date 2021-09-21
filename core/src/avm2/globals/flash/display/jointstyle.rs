@@ -5,7 +5,6 @@ use crate::avm2::class::{Class, ClassAttributes};
 use crate::avm2::method::Method;
 use crate::avm2::names::{Namespace, QName};
 use crate::avm2::object::Object;
-use crate::avm2::traits::Trait;
 use crate::avm2::value::Value;
 use crate::avm2::Error;
 use gc_arena::{GcCell, MutationContext};
@@ -37,8 +36,8 @@ pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>
     let class = Class::new(
         QName::new(Namespace::package("flash.display"), "JointStyle"),
         Some(QName::new(Namespace::public(), "Object").into()),
-        Method::from_builtin(instance_init),
-        Method::from_builtin(class_init),
+        Method::from_builtin(instance_init, "<JointStyle instance initializer>", mc),
+        Method::from_builtin(class_init, "<JointStyle class initializer>", mc),
         mc,
     );
 
@@ -46,21 +45,9 @@ pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>
 
     write.set_attributes(ClassAttributes::SEALED);
 
-    write.define_class_trait(Trait::from_const(
-        QName::new(Namespace::public(), "BEVEL"),
-        QName::new(Namespace::public(), "String").into(),
-        Some("bevel".into()),
-    ));
-    write.define_class_trait(Trait::from_const(
-        QName::new(Namespace::public(), "MITER"),
-        QName::new(Namespace::public(), "String").into(),
-        Some("miter".into()),
-    ));
-    write.define_class_trait(Trait::from_const(
-        QName::new(Namespace::public(), "ROUND"),
-        QName::new(Namespace::public(), "String").into(),
-        Some("round".into()),
-    ));
+    const CONSTANTS: &[(&str, &str)] =
+        &[("BEVEL", "bevel"), ("MITER", "miter"), ("ROUND", "round")];
+    write.define_public_constant_string_class_traits(CONSTANTS);
 
     class
 }

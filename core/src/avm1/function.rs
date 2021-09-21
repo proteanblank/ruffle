@@ -6,13 +6,13 @@ use crate::avm1::object::super_object::SuperObject;
 use crate::avm1::property::Attribute;
 use crate::avm1::scope::Scope;
 use crate::avm1::value::Value;
-use crate::avm1::{Object, ObjectPtr, ScriptObject, TObject};
+use crate::avm1::{ArrayObject, Object, ObjectPtr, ScriptObject, TObject};
 use crate::display_object::{DisplayObject, TDisplayObject};
 use crate::tag_utils::SwfSlice;
 use gc_arena::{Collect, CollectionContext, Gc, GcCell, MutationContext};
 use std::borrow::Cow;
 use std::fmt;
-use swf::{avm1::types::FunctionParam, SwfStr};
+use swf::{avm1::types::FunctionFlags, SwfStr};
 
 /// Represents a function defined in Ruffle's code.
 ///
@@ -28,8 +28,11 @@ use swf::{avm1::types::FunctionParam, SwfStr};
 /// resolve on the AVM stack, as if you had called a non-native function. If
 /// your function yields `None`, you must ensure that the top-most activation
 /// in the AVM1 runtime will return with the value of this function.
-pub type NativeFunction<'gc> =
-    fn(&mut Activation<'_, 'gc, '_>, Object<'gc>, &[Value<'gc>]) -> Result<Value<'gc>, Error<'gc>>;
+pub type NativeFunction = for<'gc> fn(
+    &mut Activation<'_, 'gc, '_>,
+    Object<'gc>,
+    &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>>;
 
 /// Indicates the reason for an execution
 #[derive(Debug, Clone)]
@@ -58,16 +61,6 @@ pub struct Avm1Function<'gc> {
     /// set. Any register beyond this ID will be served from the global one.
     register_count: u8,
 
-    preload_parent: bool,
-    preload_root: bool,
-    suppress_super: bool,
-    preload_super: bool,
-    suppress_arguments: bool,
-    preload_arguments: bool,
-    suppress_this: bool,
-    preload_this: bool,
-    preload_global: bool,
-
     /// The names of the function parameters and their register mappings.
     /// r0 indicates that no register shall be written and the parameter stored
     /// as a Variable instead.
@@ -82,6 +75,10 @@ pub struct Avm1Function<'gc> {
     /// The base movie clip that the function was defined on.
     /// This is the movie clip that contains the bytecode.
     base_clip: DisplayObject<'gc>,
+
+    /// The flags that define the preloaded registers of the function.
+    #[collect(require_static)]
+    flags: FunctionFlags,
 }
 
 impl<'gc> Avm1Function<'gc> {
@@ -109,15 +106,6 @@ impl<'gc> Avm1Function<'gc> {
             data: actions,
             name,
             register_count: 0,
-            preload_parent: false,
-            preload_root: false,
-            suppress_super: false,
-            preload_super: false,
-            suppress_arguments: false,
-            preload_arguments: false,
-            suppress_this: false,
-            preload_this: false,
-            preload_global: false,
             params: params
                 .iter()
                 .map(|&s| {
@@ -130,6 +118,7 @@ impl<'gc> Avm1Function<'gc> {
             scope,
             constant_pool,
             base_clip,
+            flags: FunctionFlags::empty(),
         }
     }
 
@@ -152,36 +141,28 @@ impl<'gc> Avm1Function<'gc> {
             )
         };
 
-        let mut owned_params = Vec::new();
-        for FunctionParam {
-            name: s,
-            register_index: r,
-        } in &swf_function.params
-        {
-            owned_params.push((
-                *r,
-                (*s).to_string_lossy(SwfStr::encoding_for_version(swf_version)),
-            ))
-        }
+        let params = swf_function
+            .params
+            .iter()
+            .map(|p| {
+                (
+                    p.register_index,
+                    p.name
+                        .to_string_lossy(SwfStr::encoding_for_version(swf_version)),
+                )
+            })
+            .collect();
 
         Avm1Function {
             swf_version,
             data: actions,
             name,
             register_count: swf_function.register_count,
-            preload_parent: swf_function.preload_parent,
-            preload_root: swf_function.preload_root,
-            suppress_super: swf_function.suppress_super,
-            preload_super: swf_function.preload_super,
-            suppress_arguments: swf_function.suppress_arguments,
-            preload_arguments: swf_function.preload_arguments,
-            suppress_this: swf_function.suppress_this,
-            preload_this: swf_function.preload_this,
-            preload_global: swf_function.preload_global,
-            params: owned_params,
+            params,
             scope,
             constant_pool,
             base_clip,
+            flags: swf_function.flags,
         }
     }
 
@@ -207,7 +188,7 @@ impl<'gc> Avm1Function<'gc> {
 #[derive(Clone)]
 pub enum Executable<'gc> {
     /// A function provided by the Ruffle runtime and implemented in Rust.
-    Native(NativeFunction<'gc>),
+    Native(NativeFunction),
 
     /// ActionScript data defined by a previous `DefineFunction` or
     /// `DefineFunction2` action.
@@ -260,10 +241,16 @@ impl<'gc> Executable<'gc> {
                     activation.context.gc_context,
                     Scope::new_local_scope(af.scope(), activation.context.gc_context),
                 );
-                let arguments = ScriptObject::array(
-                    activation.context.gc_context,
-                    Some(activation.context.avm1.prototypes().array),
-                );
+
+                let arguments = if af.flags.contains(FunctionFlags::SUPPRESS_ARGUMENTS) {
+                    ArrayObject::empty(activation)
+                } else {
+                    ArrayObject::new(
+                        activation.context.gc_context,
+                        activation.context.avm1.prototypes().array,
+                        args.iter().cloned(),
+                    )
+                };
                 arguments.define_value(
                     activation.context.gc_context,
                     "callee",
@@ -278,31 +265,14 @@ impl<'gc> Executable<'gc> {
                     Attribute::DONT_ENUM,
                 );
 
-                if !af.suppress_arguments {
-                    for i in 0..args.len() {
-                        arguments.set_array_element(
-                            i,
-                            *args.get(i).unwrap(),
-                            activation.context.gc_context,
-                        );
-                    }
-                }
+                let super_object: Option<Object<'gc>> =
+                    if !af.flags.contains(FunctionFlags::SUPPRESS_SUPER) {
+                        Some(SuperObject::new(activation, this, base_proto.unwrap_or(this)).into())
+                    } else {
+                        None
+                    };
 
-                let argcell = arguments.into();
-                let super_object: Option<Object<'gc>> = if !af.suppress_super {
-                    Some(
-                        SuperObject::from_this_and_base_proto(
-                            this,
-                            base_proto.unwrap_or(this),
-                            activation,
-                        )?
-                        .into(),
-                    )
-                } else {
-                    None
-                };
-
-                let effective_ver = if activation.current_swf_version() > 5 {
+                let effective_ver = if activation.swf_version() > 5 {
                     af.swf_version()
                 } else {
                     this.as_display_object()
@@ -346,39 +316,39 @@ impl<'gc> Executable<'gc> {
                     base_clip,
                     this,
                     Some(callee),
-                    Some(argcell),
+                    Some(arguments.into()),
                 );
 
                 frame.allocate_local_registers(af.register_count(), frame.context.gc_context);
 
                 let mut preload_r = 1;
 
-                if af.preload_this {
+                if af.flags.contains(FunctionFlags::PRELOAD_THIS) {
                     //TODO: What happens if you specify both suppress and
                     //preload for this?
-                    frame.set_local_register(preload_r, this);
+                    frame.set_local_register(preload_r, this.into());
                     preload_r += 1;
                 }
 
-                if af.preload_arguments {
+                if af.flags.contains(FunctionFlags::PRELOAD_ARGUMENTS) {
                     //TODO: What happens if you specify both suppress and
                     //preload for arguments?
-                    frame.set_local_register(preload_r, argcell);
+                    frame.set_local_register(preload_r, arguments.into());
                     preload_r += 1;
                 }
 
                 if let Some(super_object) = super_object {
-                    if af.preload_super {
-                        frame.set_local_register(preload_r, super_object);
+                    if af.flags.contains(FunctionFlags::PRELOAD_SUPER) {
+                        frame.set_local_register(preload_r, super_object.into());
                         //TODO: What happens if you specify both suppress and
                         //preload for super?
                         preload_r += 1;
                     } else {
-                        frame.define("super", super_object);
+                        frame.force_define_local("super", super_object.into());
                     }
                 }
 
-                if af.preload_root {
+                if af.flags.contains(FunctionFlags::PRELOAD_ROOT) {
                     frame.set_local_register(
                         preload_r,
                         af.base_clip.avm1_root(&frame.context)?.object(),
@@ -386,17 +356,17 @@ impl<'gc> Executable<'gc> {
                     preload_r += 1;
                 }
 
-                if af.preload_parent {
+                if af.flags.contains(FunctionFlags::PRELOAD_PARENT) {
                     // If _parent is undefined (because this is a root timeline), it actually does not get pushed,
                     // and _global ends up incorrectly taking _parent's register.
                     // See test for more info.
-                    if let Some(parent) = af.base_clip.parent() {
+                    if let Some(parent) = af.base_clip.avm1_parent() {
                         frame.set_local_register(preload_r, parent.object());
                         preload_r += 1;
                     }
                 }
 
-                if af.preload_global {
+                if af.flags.contains(FunctionFlags::PRELOAD_GLOBAL) {
                     let global = frame.context.avm1.global_object();
                     frame.set_local_register(preload_r, global);
                 }
@@ -412,7 +382,7 @@ impl<'gc> Executable<'gc> {
                 for (param, value) in af.params.iter().zip(args_iter) {
                     match param {
                         (Some(argreg), _argname) => frame.set_local_register(*argreg, value),
-                        (None, argname) => frame.define(argname, value),
+                        (None, argname) => frame.force_define_local(argname, value),
                     }
                 }
 
@@ -422,8 +392,8 @@ impl<'gc> Executable<'gc> {
     }
 }
 
-impl<'gc> From<NativeFunction<'gc>> for Executable<'gc> {
-    fn from(nf: NativeFunction<'gc>) -> Self {
+impl<'gc> From<NativeFunction> for Executable<'gc> {
+    fn from(nf: NativeFunction) -> Self {
         Executable::Native(nf)
     }
 }
@@ -464,23 +434,20 @@ impl<'gc> FunctionObject<'gc> {
     /// Construct a function sans prototype.
     pub fn bare_function(
         gc_context: MutationContext<'gc, '_>,
-        function: Option<impl Into<Executable<'gc>>>,
-        constructor: Option<impl Into<Executable<'gc>>>,
+        function: Option<Executable<'gc>>,
+        constructor: Option<Executable<'gc>>,
         fn_proto: Option<Object<'gc>>,
     ) -> Self {
         let base = ScriptObject::object(gc_context, fn_proto);
-
-        let func = function.map(|x| x.into());
-        let cons = constructor.map(|x| x.into());
 
         FunctionObject {
             base,
             data: GcCell::allocate(
                 gc_context,
                 FunctionObjectData {
-                    function: func,
+                    function,
                     primitive: "[type Function]".into(),
-                    constructor: cons,
+                    constructor,
                 },
             ),
         }
@@ -496,8 +463,8 @@ impl<'gc> FunctionObject<'gc> {
     /// The function and its prototype will be linked to each other.
     fn allocate_function(
         gc_context: MutationContext<'gc, '_>,
-        function: Option<impl Into<Executable<'gc>>>,
-        constructor: Option<impl Into<Executable<'gc>>>,
+        function: Option<Executable<'gc>>,
+        constructor: Option<Executable<'gc>>,
         fn_proto: Option<Object<'gc>>,
         prototype: Object<'gc>,
     ) -> Object<'gc> {
@@ -526,9 +493,7 @@ impl<'gc> FunctionObject<'gc> {
         fn_proto: Option<Object<'gc>>,
         prototype: Object<'gc>,
     ) -> Object<'gc> {
-        // Avoid type inference issues
-        let none: Option<Executable> = None;
-        Self::allocate_function(gc_context, Some(function), none, fn_proto, prototype)
+        Self::allocate_function(gc_context, Some(function.into()), None, fn_proto, prototype)
     }
 
     /// Construct a regular and constructor function from an executable and associated protos.
@@ -541,8 +506,8 @@ impl<'gc> FunctionObject<'gc> {
     ) -> Object<'gc> {
         Self::allocate_function(
             gc_context,
-            Some(function),
-            Some(constructor),
+            Some(function.into()),
+            Some(constructor.into()),
             fn_proto,
             prototype,
         )
@@ -550,22 +515,24 @@ impl<'gc> FunctionObject<'gc> {
 }
 
 impl<'gc> TObject<'gc> for FunctionObject<'gc> {
-    fn get_local(
+    fn get_local_stored(
         &self,
         name: &str,
         activation: &mut Activation<'_, 'gc, '_>,
-        this: Object<'gc>,
-    ) -> Result<Value<'gc>, Error<'gc>> {
-        self.base.get_local(name, activation, this)
+    ) -> Option<Value<'gc>> {
+        self.base.get_local_stored(name, activation)
     }
 
-    fn set(
+    fn set_local(
         &self,
         name: &str,
         value: Value<'gc>,
         activation: &mut Activation<'_, 'gc, '_>,
+        this: Object<'gc>,
+        base_proto: Option<Object<'gc>>,
     ) -> Result<(), Error<'gc>> {
-        self.base.set(name, value, activation)
+        self.base
+            .set_local(name, value, activation, this, base_proto)
     }
 
     fn call(
@@ -597,20 +564,18 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
         this: Object<'gc>,
         args: &[Value<'gc>],
     ) -> Result<(), Error<'gc>> {
-        this.set("__constructor__", (*self).into(), activation)?;
-        this.set_attributes(
+        this.define_value(
             activation.context.gc_context,
-            Some("__constructor__"),
+            "__constructor__",
+            (*self).into(),
             Attribute::DONT_ENUM,
-            Attribute::empty(),
         );
-        if activation.current_swf_version() < 7 {
-            this.set("constructor", (*self).into(), activation)?;
-            this.set_attributes(
+        if activation.swf_version() < 7 {
+            this.define_value(
                 activation.context.gc_context,
-                Some("constructor"),
+                "constructor",
+                (*self).into(),
                 Attribute::DONT_ENUM,
-                Attribute::empty(),
             );
         }
         if let Some(exec) = &self.data.read().constructor {
@@ -639,20 +604,18 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
             .coerce_to_object(activation);
         let this = prototype.create_bare_object(activation, prototype)?;
 
-        this.set("__constructor__", (*self).into(), activation)?;
-        this.set_attributes(
+        this.define_value(
             activation.context.gc_context,
-            Some("__constructor__"),
+            "__constructor__",
+            (*self).into(),
             Attribute::DONT_ENUM,
-            Attribute::empty(),
         );
-        if activation.current_swf_version() < 7 {
-            this.set("constructor", (*self).into(), activation)?;
-            this.set_attributes(
+        if activation.swf_version() < 7 {
+            this.define_value(
                 activation.context.gc_context,
-                Some("constructor"),
+                "constructor",
+                (*self).into(),
                 Attribute::DONT_ENUM,
-                Attribute::empty(),
             );
         }
         if let Some(exec) = &self.data.read().constructor {
@@ -674,13 +637,12 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
         }
     }
 
-    fn call_setter(
-        &self,
-        name: &str,
-        value: Value<'gc>,
-        activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Option<Object<'gc>> {
-        self.base.call_setter(name, value, activation)
+    fn getter(&self, name: &str, activation: &mut Activation<'_, 'gc, '_>) -> Option<Object<'gc>> {
+        self.base.getter(name, activation)
+    }
+
+    fn setter(&self, name: &str, activation: &mut Activation<'_, 'gc, '_>) -> Option<Object<'gc>> {
+        self.base.setter(name, activation)
     }
 
     fn create_bare_object(
@@ -708,12 +670,8 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
         self.base.delete(activation, name)
     }
 
-    fn proto(&self) -> Value<'gc> {
-        self.base.proto()
-    }
-
-    fn set_proto(&self, gc_context: MutationContext<'gc, '_>, prototype: Value<'gc>) {
-        self.base.set_proto(gc_context, prototype);
+    fn proto(&self, activation: &mut Activation<'_, 'gc, '_>) -> Value<'gc> {
+        self.base.proto(activation)
     }
 
     fn define_value(
@@ -752,35 +710,37 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
     fn add_property_with_case(
         &self,
         activation: &mut Activation<'_, 'gc, '_>,
-        gc_context: MutationContext<'gc, '_>,
         name: &str,
         get: Object<'gc>,
         set: Option<Object<'gc>>,
         attributes: Attribute,
     ) {
         self.base
-            .add_property_with_case(activation, gc_context, name, get, set, attributes)
+            .add_property_with_case(activation, name, get, set, attributes)
     }
 
-    fn set_watcher(
+    fn call_watcher(
         &self,
         activation: &mut Activation<'_, 'gc, '_>,
-        gc_context: MutationContext<'gc, '_>,
+        name: &str,
+        value: &mut Value<'gc>,
+        this: Object<'gc>,
+    ) -> Result<(), Error<'gc>> {
+        self.base.call_watcher(activation, name, value, this)
+    }
+
+    fn watch(
+        &self,
+        activation: &mut Activation<'_, 'gc, '_>,
         name: Cow<str>,
         callback: Object<'gc>,
         user_data: Value<'gc>,
     ) {
-        self.base
-            .set_watcher(activation, gc_context, name, callback, user_data);
+        self.base.watch(activation, name, callback, user_data);
     }
 
-    fn remove_watcher(
-        &self,
-        activation: &mut Activation<'_, 'gc, '_>,
-        gc_context: MutationContext<'gc, '_>,
-        name: Cow<str>,
-    ) -> bool {
-        self.base.remove_watcher(activation, gc_context, name)
+    fn unwatch(&self, activation: &mut Activation<'_, 'gc, '_>, name: Cow<str>) -> bool {
+        self.base.unwatch(activation, name)
     }
 
     fn has_property(&self, activation: &mut Activation<'_, 'gc, '_>, name: &str) -> bool {
@@ -801,10 +761,6 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
 
     fn get_keys(&self, activation: &mut Activation<'_, 'gc, '_>) -> Vec<String> {
         self.base.get_keys(activation)
-    }
-
-    fn as_string(&self) -> Cow<str> {
-        Cow::Borrowed("[type Function]")
     }
 
     fn type_of(&self) -> &'static str {
@@ -832,33 +788,37 @@ impl<'gc> TObject<'gc> for FunctionObject<'gc> {
         self.base.as_ptr()
     }
 
-    fn length(&self) -> usize {
-        self.base.length()
+    fn length(&self, activation: &mut Activation<'_, 'gc, '_>) -> Result<i32, Error<'gc>> {
+        self.base.length(activation)
     }
 
-    fn set_length(&self, gc_context: MutationContext<'gc, '_>, new_length: usize) {
-        self.base.set_length(gc_context, new_length)
-    }
-
-    fn array(&self) -> Vec<Value<'gc>> {
-        self.base.array()
-    }
-
-    fn array_element(&self, index: usize) -> Value<'gc> {
-        self.base.array_element(index)
-    }
-
-    fn set_array_element(
+    fn set_length(
         &self,
-        index: usize,
-        value: Value<'gc>,
-        gc_context: MutationContext<'gc, '_>,
-    ) -> usize {
-        self.base.set_array_element(index, value, gc_context)
+        activation: &mut Activation<'_, 'gc, '_>,
+        length: i32,
+    ) -> Result<(), Error<'gc>> {
+        self.base.set_length(activation, length)
     }
 
-    fn delete_array_element(&self, index: usize, gc_context: MutationContext<'gc, '_>) {
-        self.base.delete_array_element(index, gc_context)
+    fn has_element(&self, activation: &mut Activation<'_, 'gc, '_>, index: i32) -> bool {
+        self.base.has_element(activation, index)
+    }
+
+    fn get_element(&self, activation: &mut Activation<'_, 'gc, '_>, index: i32) -> Value<'gc> {
+        self.base.get_element(activation, index)
+    }
+
+    fn set_element(
+        &self,
+        activation: &mut Activation<'_, 'gc, '_>,
+        index: i32,
+        value: Value<'gc>,
+    ) -> Result<(), Error<'gc>> {
+        self.base.set_element(activation, index, value)
+    }
+
+    fn delete_element(&self, activation: &mut Activation<'_, 'gc, '_>, index: i32) -> bool {
+        self.base.delete_element(activation, index)
     }
 }
 

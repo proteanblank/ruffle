@@ -1,15 +1,13 @@
 //! `RegExp` impl
 
 use crate::avm2::class::Class;
-use crate::avm2::method::Method;
+use crate::avm2::method::{Method, NativeMethodImpl, ParamConfig};
 use crate::avm2::names::{Namespace, QName};
-use crate::avm2::object::{ArrayObject, Object, RegExpObject, TObject};
-use crate::avm2::scope::Scope;
-use crate::avm2::string::AvmString;
-use crate::avm2::traits::Trait;
+use crate::avm2::object::{regexp_allocator, ArrayObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
 use crate::avm2::{activation::Activation, array::ArrayStorage};
+use crate::string::AvmString;
 use gc_arena::{GcCell, MutationContext};
 
 /// Implements `RegExp`'s instance initializer.
@@ -198,7 +196,7 @@ pub fn exec<'gc>(
                 Some(matched) => {
                     let substrings = matched
                         .groups()
-                        .map(|range| text[range.unwrap()].to_string());
+                        .map(|range| text[range.unwrap_or(0..0)].to_string());
 
                     let mut storage = ArrayStorage::new(0);
                     for substring in substrings {
@@ -211,17 +209,7 @@ pub fn exec<'gc>(
                 None => return Ok(Value::Null),
             };
 
-            let object = ArrayObject::from_array(
-                storage,
-                activation
-                    .context
-                    .avm2
-                    .system_prototypes
-                    .as_ref()
-                    .map(|sp| sp.array)
-                    .unwrap(),
-                activation.context.gc_context,
-            );
+            let object = ArrayObject::from_storage(activation, storage)?;
 
             object.set_property_local(
                 object,
@@ -268,68 +256,44 @@ pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>
     let class = Class::new(
         QName::new(Namespace::public(), "RegExp"),
         Some(QName::new(Namespace::public(), "Object").into()),
-        Method::from_builtin(instance_init),
-        Method::from_builtin(class_init),
+        Method::from_builtin_and_params(
+            instance_init,
+            "<RegExp instance initializer>",
+            vec![
+                ParamConfig::optional("re", QName::new(Namespace::public(), "String").into(), ""),
+                ParamConfig::optional(
+                    "flags",
+                    QName::new(Namespace::public(), "String").into(),
+                    "",
+                ),
+            ],
+            false,
+            mc,
+        ),
+        Method::from_builtin(class_init, "<RegExp class initializer>", mc),
         mc,
     );
 
     let mut write = class.write(mc);
+    write.set_instance_allocator(regexp_allocator);
 
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "dotall"),
-        Method::from_builtin(dotall),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "extended"),
-        Method::from_builtin(extended),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "global"),
-        Method::from_builtin(global),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "ignoreCase"),
-        Method::from_builtin(ignore_case),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "multiline"),
-        Method::from_builtin(multiline),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "lastIndex"),
-        Method::from_builtin(last_index),
-    ));
-    write.define_instance_trait(Trait::from_setter(
-        QName::new(Namespace::public(), "lastIndex"),
-        Method::from_builtin(set_last_index),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "source"),
-        Method::from_builtin(source),
-    ));
+    const PUBLIC_INSTANCE_PROPERTIES: &[(
+        &str,
+        Option<NativeMethodImpl>,
+        Option<NativeMethodImpl>,
+    )] = &[
+        ("dotall", Some(dotall), None),
+        ("extended", Some(extended), None),
+        ("global", Some(global), None),
+        ("ignoreCase", Some(ignore_case), None),
+        ("multiline", Some(multiline), None),
+        ("lastIndex", Some(last_index), Some(set_last_index)),
+        ("source", Some(source), None),
+    ];
+    write.define_public_builtin_instance_properties(mc, PUBLIC_INSTANCE_PROPERTIES);
 
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "exec"),
-        Method::from_builtin(exec),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::as3_namespace(), "test"),
-        Method::from_builtin(test),
-    ));
+    const AS3_INSTANCE_METHODS: &[(&str, NativeMethodImpl)] = &[("exec", exec), ("test", test)];
+    write.define_as3_builtin_instance_methods(mc, AS3_INSTANCE_METHODS);
 
     class
-}
-
-pub fn regexp_deriver<'gc>(
-    base_proto: Object<'gc>,
-    activation: &mut Activation<'_, 'gc, '_>,
-    class: GcCell<'gc, Class<'gc>>,
-    scope: Option<GcCell<'gc, Scope<'gc>>>,
-) -> Result<Object<'gc>, Error> {
-    Ok(RegExpObject::derive(
-        base_proto,
-        activation.context.gc_context,
-        class,
-        scope,
-    ))
 }

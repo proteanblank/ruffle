@@ -2,10 +2,9 @@
 
 use crate::avm2::activation::Activation;
 use crate::avm2::class::Class;
-use crate::avm2::method::Method;
+use crate::avm2::method::{Method, NativeMethodImpl};
 use crate::avm2::names::{Namespace, QName};
 use crate::avm2::object::{Object, TObject};
-use crate::avm2::traits::Trait;
 use crate::avm2::value::Value;
 use crate::avm2::Error;
 use crate::context::UpdateContext;
@@ -15,6 +14,15 @@ use std::cmp::min;
 
 /// Implements `flash.display.DisplayObjectContainer`'s instance constructor.
 pub fn instance_init<'gc>(
+    _activation: &mut Activation<'_, 'gc, '_>,
+    _this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error> {
+    Err("You cannot construct DisplayObjectContainer directly.".into())
+}
+
+/// Implements `flash.display.DisplayObjectContainer`'s native instance constructor.
+pub fn native_instance_init<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
@@ -83,7 +91,7 @@ fn validate_remove_operation<'gc>(
         .as_container()
         .ok_or("ArgumentError: Parent is not a DisplayObjectContainer")?;
 
-    for child in old_ctr.iter_execution_list() {
+    for child in old_ctr.iter_render_list() {
         if DisplayObject::ptr_eq(child, proposed_child) {
             return Ok(());
         }
@@ -579,77 +587,51 @@ pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>
             "DisplayObjectContainer",
         ),
         Some(QName::new(Namespace::package("flash.display"), "InteractiveObject").into()),
-        Method::from_builtin(instance_init),
-        Method::from_builtin(class_init),
+        Method::from_builtin(
+            instance_init,
+            "<DisplayObjectContainer instance initializer>",
+            mc,
+        ),
+        Method::from_builtin(class_init, "<DisplayObjectContainer class initializer>", mc),
         mc,
     );
 
     let mut write = class.write(mc);
 
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "getChildAt"),
-        Method::from_builtin(get_child_at),
+    write.set_native_instance_init(Method::from_builtin(
+        native_instance_init,
+        "<DisplayObjectContainer native instance initializer>",
+        mc,
     ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "getChildByName"),
-        Method::from_builtin(get_child_by_name),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "numChildren"),
-        Method::from_builtin(num_children),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "addChild"),
-        Method::from_builtin(add_child),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "addChildAt"),
-        Method::from_builtin(add_child_at),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "removeChild"),
-        Method::from_builtin(remove_child),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "contains"),
-        Method::from_builtin(contains),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "getChildIndex"),
-        Method::from_builtin(get_child_index),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "removeChildAt"),
-        Method::from_builtin(remove_child_at),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "removeChildren"),
-        Method::from_builtin(remove_children),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "setChildIndex"),
-        Method::from_builtin(set_child_index),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "swapChildrenAt"),
-        Method::from_builtin(swap_children_at),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "swapChildren"),
-        Method::from_builtin(swap_children),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "stopAllMovieClips"),
-        Method::from_builtin(stop_all_movie_clips),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "getObjectsUnderPoint"),
-        Method::from_builtin(get_objects_under_point),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "areInaccessibleObjectsUnderPoint"),
-        Method::from_builtin(are_inaccessible_objects_under_point),
-    ));
+
+    const PUBLIC_INSTANCE_PROPERTIES: &[(
+        &str,
+        Option<NativeMethodImpl>,
+        Option<NativeMethodImpl>,
+    )] = &[("numChildren", Some(num_children), None)];
+    write.define_public_builtin_instance_properties(mc, PUBLIC_INSTANCE_PROPERTIES);
+
+    const PUBLIC_INSTANCE_METHODS: &[(&str, NativeMethodImpl)] = &[
+        ("getChildAt", get_child_at),
+        ("getChildByName", get_child_by_name),
+        ("addChild", add_child),
+        ("addChildAt", add_child_at),
+        ("removeChild", remove_child),
+        ("contains", contains),
+        ("getChildIndex", get_child_index),
+        ("removeChildAt", remove_child_at),
+        ("removeChildren", remove_children),
+        ("setChildIndex", set_child_index),
+        ("swapChildrenAt", swap_children_at),
+        ("swapChildren", swap_children),
+        ("stopAllMovieClips", stop_all_movie_clips),
+        ("getObjectsUnderPoint", get_objects_under_point),
+        (
+            "areInaccessibleObjectsUnderPoint",
+            are_inaccessible_objects_under_point,
+        ),
+    ];
+    write.define_public_builtin_instance_methods(mc, PUBLIC_INSTANCE_METHODS);
 
     class
 }

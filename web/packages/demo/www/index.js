@@ -21,8 +21,11 @@ const sampleFileInputContainer = document.getElementById(
 );
 const localFileInput = document.getElementById("local-file");
 const sampleFileInput = document.getElementById("sample-swfs");
-const animOptGroup = document.getElementById("anim-optgroup");
-const gamesOptGroup = document.getElementById("games-optgroup");
+// prettier-ignore
+const optionGroups = {
+    "Animation": document.getElementById("anim-optgroup"),
+    "Game": document.getElementById("games-optgroup"),
+};
 
 // Default config used by the player.
 const config = {
@@ -66,7 +69,8 @@ async function loadFile(file) {
         return;
     }
     hideSample();
-    load({ data: await new Response(file).arrayBuffer(), ...config });
+    const data = await new Response(file).arrayBuffer();
+    load({ data, ...config });
 }
 
 function loadSample() {
@@ -104,10 +108,17 @@ main.addEventListener("drop", (event) => {
     event.stopPropagation();
     event.preventDefault();
     overlay.classList.remove("drag");
+    localFileInput.files = event.dataTransfer.files;
     loadFile(event.dataTransfer.files[0]);
 });
 
 window.addEventListener("load", () => {
+    if (
+        navigator.userAgent.match(/iPad/i) ||
+        navigator.userAgent.match(/iPhone/i)
+    ) {
+        localFileInput.removeAttribute("accept");
+    }
     overlay.classList.remove("hidden");
 });
 
@@ -123,14 +134,7 @@ window.addEventListener("load", () => {
         option.textContent = swfData.title;
         option.value = swfData.location;
         option.swfData = swfData;
-        switch (swfData.type) {
-            case "Animation":
-                animOptGroup.append(option);
-                break;
-            case "Game":
-                gamesOptGroup.append(option);
-                break;
-        }
+        optionGroups[swfData.type].append(option);
     }
     sampleFileInputContainer.classList.remove("hidden");
 

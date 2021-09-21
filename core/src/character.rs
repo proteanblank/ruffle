@@ -1,6 +1,7 @@
 use crate::backend::audio::SoundHandle;
+use crate::binary_data::BinaryData;
 use crate::display_object::{
-    Bitmap, Button, EditText, Graphic, MorphShape, MovieClip, Text, Video,
+    Avm1Button, Avm2Button, Bitmap, EditText, Graphic, MorphShape, MovieClip, Text, Video,
 };
 use crate::font::Font;
 use gc_arena::Collect;
@@ -12,10 +13,12 @@ pub enum Character<'gc> {
     Graphic(Graphic<'gc>),
     MovieClip(MovieClip<'gc>),
     Bitmap(Bitmap<'gc>),
-    Button(Button<'gc>),
+    Avm1Button(Avm1Button<'gc>),
+    Avm2Button(Avm2Button<'gc>),
     Font(Font<'gc>),
     MorphShape(MorphShape<'gc>),
     Text(Text<'gc>),
     Sound(#[collect(require_static)] SoundHandle),
     Video(Video<'gc>),
+    BinaryData(BinaryData),
 }

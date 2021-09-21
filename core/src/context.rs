@@ -2,7 +2,7 @@
 
 use crate::avm1::globals::system::SystemProperties;
 use crate::avm1::{Avm1, Object as Avm1Object, Timers, Value as Avm1Value};
-use crate::avm2::{Avm2, Object as Avm2Object, Value as Avm2Value};
+use crate::avm2::{Avm2, Event as Avm2Event, Object as Avm2Object, Value as Avm2Value};
 use crate::backend::{
     audio::{AudioBackend, AudioManager, SoundHandle, SoundInstanceHandle},
     locale::LocaleBackend,
@@ -13,7 +13,8 @@ use crate::backend::{
     ui::UiBackend,
     video::VideoBackend,
 };
-use crate::display_object::{EditText, MovieClip, SoundTransform};
+use crate::context_menu::ContextMenuState;
+use crate::display_object::{EditText, MovieClip, SoundTransform, Stage};
 use crate::external::ExternalInterface;
 use crate::focus_tracker::FocusTracker;
 use crate::library::Library;
@@ -26,21 +27,17 @@ use core::fmt;
 use gc_arena::{Collect, MutationContext};
 use instant::Instant;
 use rand::rngs::SmallRng;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 /// `UpdateContext` holds shared data that is used by the various subsystems of Ruffle.
-/// `Player` crates this when it begins a tick and passes it through the call stack to
+/// `Player` creates this when it begins a tick and passes it through the call stack to
 /// children and the VM.
 pub struct UpdateContext<'a, 'gc, 'gc_context> {
     /// The queue of actions that will be run after the display list updates.
     /// Display objects and actions can push actions onto the queue.
     pub action_queue: &'a mut ActionQueue<'gc>,
-
-    /// The background color of the Stage. Changed by the `SetBackgroundColor` SWF tag.
-    /// TODO: Move this into a `Stage` display object.
-    pub background_color: &'a mut Option<Color>,
 
     /// The mutation context to allocate and mutate `GcCell` types.
     pub gc_context: MutationContext<'gc, 'gc_context>,
@@ -56,7 +53,7 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
     /// variables.
     pub player_version: u8,
 
-    /// Requests a that the player re-renders after this execution (e.g. due to `updateAfterEvent`).
+    /// Requests that the player re-renders after this execution (e.g. due to `updateAfterEvent`).
     pub needs_render: &'a mut bool,
 
     /// The root SWF file.
@@ -92,20 +89,20 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
     /// The RNG, used by the AVM `RandomNumber` opcode,  `Math.random(),` and `random()`.
     pub rng: &'a mut SmallRng,
 
-    /// All loaded levels of the current player.
-    pub levels: &'a mut BTreeMap<u32, DisplayObject<'gc>>,
+    /// The current player's stage (including all loaded levels)
+    pub stage: Stage<'gc>,
 
     /// The display object that the mouse is currently hovering over.
-    pub mouse_hovered_object: Option<DisplayObject<'gc>>,
+    pub mouse_over_object: Option<DisplayObject<'gc>>,
+
+    /// If the mouse is down, the display object that the mouse is currently pressing.
+    pub mouse_down_object: Option<DisplayObject<'gc>>,
 
     /// The location of the mouse when it was last over the player.
     pub mouse_position: &'a (Twips, Twips),
 
     /// The object being dragged via a `startDrag` action.
     pub drag_object: &'a mut Option<crate::player::DragObject<'gc>>,
-
-    /// The dimensions of the stage.
-    pub stage_size: (Twips, Twips),
 
     /// Weak reference to the player.
     ///
@@ -134,6 +131,8 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
     /// Timed callbacks created with `setInterval`/`setTimeout`.
     pub timers: &'a mut Timers<'gc>,
 
+    pub current_context_menu: &'a mut Option<ContextMenuState<'gc>>,
+
     /// The AVM1 global state.
     pub avm1: &'a mut Avm1<'gc>,
 
@@ -158,6 +157,9 @@ pub struct UpdateContext<'a, 'gc, 'gc_context> {
 
     /// This frame's current fake time offset, used to pretend passage of time in time functions
     pub time_offset: &'a mut u32,
+
+    /// The current stage frame rate.
+    pub frame_rate: &'a mut f64,
 }
 
 /// Convenience methods for controlling audio.
@@ -167,7 +169,7 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
             self.audio,
             self.gc_context,
             self.action_queue,
-            *self.levels.get(&0).unwrap(),
+            self.stage.root_clip(),
         );
     }
 
@@ -180,6 +182,21 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
             .set_global_sound_transform(sound_transform);
     }
 
+    /// Get the local sound transform of a single sound instance.
+    pub fn local_sound_transform(&self, instance: SoundInstanceHandle) -> Option<&SoundTransform> {
+        self.audio_manager.local_sound_transform(instance)
+    }
+
+    /// Set the local sound transform of a single sound instance.
+    pub fn set_local_sound_transform(
+        &mut self,
+        instance: SoundInstanceHandle,
+        sound_transform: SoundTransform,
+    ) {
+        self.audio_manager
+            .set_local_sound_transform(instance, sound_transform);
+    }
+
     pub fn start_sound(
         &mut self,
         sound: SoundHandle,
@@ -189,6 +206,15 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
     ) -> Option<SoundInstanceHandle> {
         self.audio_manager
             .start_sound(self.audio, sound, settings, owner, avm1_object)
+    }
+
+    pub fn attach_avm2_sound_channel(
+        &mut self,
+        instance: SoundInstanceHandle,
+        avm2_object: Avm2Object<'gc>,
+    ) {
+        self.audio_manager
+            .attach_avm2_sound_channel(instance, avm2_object);
     }
 
     pub fn stop_sound(&mut self, instance: SoundInstanceHandle) {
@@ -250,7 +276,6 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
     {
         UpdateContext {
             action_queue: self.action_queue,
-            background_color: self.background_color,
             gc_context: self.gc_context,
             library: self.library,
             player_version: self.player_version,
@@ -266,11 +291,11 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
             video: self.video,
             storage: self.storage,
             rng: self.rng,
-            levels: self.levels,
-            mouse_hovered_object: self.mouse_hovered_object,
+            stage: self.stage,
+            mouse_over_object: self.mouse_over_object,
+            mouse_down_object: self.mouse_down_object,
             mouse_position: self.mouse_position,
             drag_object: self.drag_object,
-            stage_size: self.stage_size,
             player: self.player.clone(),
             load_manager: self.load_manager,
             system: self.system,
@@ -278,6 +303,7 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
             shared_objects: self.shared_objects,
             unbound_text_fields: self.unbound_text_fields,
             timers: self.timers,
+            current_context_menu: self.current_context_menu,
             avm1: self.avm1,
             avm2: self.avm2,
             external_interface: self.external_interface,
@@ -286,6 +312,7 @@ impl<'a, 'gc, 'gc_context> UpdateContext<'a, 'gc, 'gc_context> {
             focus_tracker: self.focus_tracker,
             times_get_time_called: self.times_get_time_called,
             time_offset: self.time_offset,
+            frame_rate: self.frame_rate,
         }
     }
 }
@@ -370,13 +397,17 @@ pub struct RenderContext<'a, 'gc> {
     /// The renderer, used by the display objects to draw themselves.
     pub renderer: &'a mut dyn RenderBackend,
 
+    /// The UI backend, used to detect user interactions.
+    pub ui: &'a mut dyn UiBackend,
+
     /// The library, which provides access to fonts and other definitions when rendering.
     pub library: &'a Library<'gc>,
 
     /// The transform stack controls the matrix and color transform as we traverse the display hierarchy.
     pub transform_stack: &'a mut TransformStack,
-    /// The bounds of the current viewport in twips. Used for culling.
-    pub view_bounds: BoundingBox,
+
+    /// The current player's stage (including all loaded levels)
+    pub stage: Stage<'gc>,
 
     /// The stack of clip depths, used in masking.
     pub clip_depth_stack: Vec<Depth>,
@@ -393,10 +424,10 @@ pub enum ActionType<'gc> {
     /// Normal frame or event actions.
     Normal { bytecode: SwfSlice },
 
-    /// AVM1 initialize clip event
+    /// AVM1 initialize clip event.
     Initialize { bytecode: SwfSlice },
 
-    /// Construct a movie with a custom class or on(construct) events
+    /// Construct a movie with a custom class or on(construct) events.
     Construct {
         constructor: Option<Avm1Object<'gc>>,
         events: Vec<SwfSlice>,
@@ -409,7 +440,7 @@ pub enum ActionType<'gc> {
         args: Vec<Avm1Value<'gc>>,
     },
 
-    /// A system listener method,
+    /// A system listener method.
     NotifyListeners {
         listener: &'static str,
         method: &'static str,
@@ -421,6 +452,12 @@ pub enum ActionType<'gc> {
         callable: Avm2Object<'gc>,
         reciever: Option<Avm2Object<'gc>>,
         args: Vec<Avm2Value<'gc>>,
+    },
+
+    /// An AVM2 event to be dispatched.
+    Event2 {
+        event: Avm2Event<'gc>,
+        target: Avm2Object<'gc>,
     },
 }
 
@@ -478,6 +515,11 @@ impl fmt::Debug for ActionType<'_> {
                 .field("callable", callable)
                 .field("reciever", reciever)
                 .field("args", args)
+                .finish(),
+            ActionType::Event2 { event, target } => f
+                .debug_struct("ActionType::Event2")
+                .field("event", event)
+                .field("target", target)
                 .finish(),
         }
     }

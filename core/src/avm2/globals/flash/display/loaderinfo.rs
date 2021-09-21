@@ -3,18 +3,14 @@
 use crate::avm2::activation::Activation;
 use crate::avm2::bytearray::Endian;
 use crate::avm2::class::{Class, ClassAttributes};
-use crate::avm2::method::Method;
+use crate::avm2::method::{Method, NativeMethodImpl};
 use crate::avm2::names::{Namespace, QName};
-use crate::avm2::object::{
-    ByteArrayObject, DomainObject, LoaderInfoObject, LoaderStream, Object, ScriptObject, TObject,
-};
-use crate::avm2::scope::Scope;
-use crate::avm2::traits::Trait;
+use crate::avm2::object::{loaderinfo_allocator, DomainObject, LoaderStream, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::{AvmString, Error};
 use crate::display_object::TDisplayObject;
 use gc_arena::{GcCell, MutationContext};
-use swf::{write_swf, Compression, Swf};
+use swf::{write_swf, Compression};
 
 /// Implements `flash.display.LoaderInfo`'s instance constructor.
 pub fn instance_init<'gc>(
@@ -23,6 +19,19 @@ pub fn instance_init<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error> {
     Err("LoaderInfo cannot be constructed".into())
+}
+
+/// Implements `flash.display.LoaderInfo`'s native instance constructor.
+pub fn native_instance_init<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error> {
+    if let Some(this) = this {
+        activation.super_init(this, &[])?;
+    }
+
+    Ok(Value::Undefined)
 }
 
 /// Implements `flash.display.LoaderInfo`'s class constructor.
@@ -43,6 +52,9 @@ pub fn action_script_version<'gc>(
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => {
+                    return Err("Error: The stage's loader info does not have an AS version".into())
+                }
                 LoaderStream::Swf(movie, _) => {
                     let library = activation
                         .context
@@ -66,17 +78,20 @@ pub fn application_domain<'gc>(
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => {
+                    return Ok(DomainObject::from_domain(
+                        activation,
+                        activation.context.avm2.global_domain(),
+                    )?
+                    .into());
+                }
                 LoaderStream::Swf(movie, _) => {
-                    let library = activation
+                    let domain = activation
                         .context
                         .library
-                        .library_for_movie_mut(movie.clone());
-                    return Ok(DomainObject::from_domain(
-                        activation.context.gc_context,
-                        Some(activation.context.avm2.prototypes().application_domain),
-                        library.avm2_domain(),
-                    )
-                    .into());
+                        .library_for_movie_mut(movie.clone())
+                        .avm2_domain();
+                    return Ok(DomainObject::from_domain(activation, domain)?.into());
                 }
             }
         }
@@ -90,15 +105,16 @@ pub fn application_domain<'gc>(
 /// TODO: This is also the getter for `bytesLoaded` as we don't yet support
 /// streaming loads yet. When we do, we'll need another property for this.
 pub fn bytes_total<'gc>(
-    _activation: &mut Activation<'_, 'gc, '_>,
+    activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error> {
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => return Ok(activation.context.swf.compressed_len().into()),
                 LoaderStream::Swf(movie, _) => {
-                    return Ok(movie.compressed_length().into());
+                    return Ok(movie.compressed_len().into());
                 }
             }
         }
@@ -109,13 +125,14 @@ pub fn bytes_total<'gc>(
 
 /// `content` getter
 pub fn content<'gc>(
-    _activation: &mut Activation<'_, 'gc, '_>,
+    activation: &mut Activation<'_, 'gc, '_>,
     this: Option<Object<'gc>>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error> {
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => return Ok(activation.context.stage.root_clip().object2()),
                 LoaderStream::Swf(_, root) => {
                     return Ok(root.object2());
                 }
@@ -135,6 +152,7 @@ pub fn content_type<'gc>(
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => return Ok(Value::Null),
                 LoaderStream::Swf(_, _) => {
                     return Ok("application/x-shockwave-flash".into());
                 }
@@ -154,8 +172,11 @@ pub fn frame_rate<'gc>(
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => {
+                    return Err("Error: The stage's loader info does not have a frame rate".into())
+                }
                 LoaderStream::Swf(root, _) => {
-                    return Ok(root.header().frame_rate.into());
+                    return Ok(root.frame_rate().to_f64().into());
                 }
             }
         }
@@ -173,10 +194,11 @@ pub fn height<'gc>(
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => {
+                    return Err("Error: The stage's loader info does not have a height".into())
+                }
                 LoaderStream::Swf(root, _) => {
-                    let y_min = root.header().stage_size.y_min;
-                    let y_max = root.header().stage_size.y_max;
-                    return Ok((y_max - y_min).to_pixels().into());
+                    return Ok(root.height().to_pixels().into());
                 }
             }
         }
@@ -203,8 +225,11 @@ pub fn swf_version<'gc>(
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => {
+                    return Err("Error: The stage's loader info does not have a SWF version".into())
+                }
                 LoaderStream::Swf(root, _) => {
-                    return Ok(root.header().version.into());
+                    return Ok(root.version().into());
                 }
             }
         }
@@ -222,6 +247,9 @@ pub fn url<'gc>(
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => {
+                    return Err("Error: The stage's loader info does not have a URL".into())
+                }
                 LoaderStream::Swf(root, _) => {
                     let url = root.url().unwrap_or("").to_string();
                     return Ok(AvmString::new(activation.context.gc_context, url).into());
@@ -242,10 +270,11 @@ pub fn width<'gc>(
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => {
+                    return Err("Error: The stage's loader info does not have a width".into())
+                }
                 LoaderStream::Swf(root, _) => {
-                    let x_min = root.header().stage_size.x_min;
-                    let x_max = root.header().stage_size.x_max;
-                    return Ok((x_max - x_min).to_pixels().into());
+                    return Ok(root.width().to_pixels().into());
                 }
             }
         }
@@ -263,40 +292,36 @@ pub fn bytes<'gc>(
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => {
+                    return Err("Error: The stage's loader info does not have a bytestream".into())
+                }
                 LoaderStream::Swf(root, _) => {
-                    let ba_proto = activation.context.avm2.prototypes().bytearray;
-                    let ba =
-                        ByteArrayObject::construct(activation.context.gc_context, Some(ba_proto));
+                    let ba_class = activation.context.avm2.classes().bytearray;
+
+                    let ba = ba_class.construct(activation, &[])?;
                     let mut ba_write = ba.as_bytearray_mut(activation.context.gc_context).unwrap();
 
                     // First, write a fake header corresponding to an
                     // uncompressed SWF
-                    let mut header = root.header().clone();
+                    let mut header = root.header().swf_header().clone();
                     header.compression = Compression::None;
-                    header.uncompressed_length = root.data().len() as u32;
 
-                    write_swf(
-                        &Swf {
-                            header,
-                            tags: vec![],
-                        },
-                        &mut *ba_write,
-                    )
-                    .unwrap();
+                    write_swf(&header, &[], &mut *ba_write).unwrap();
 
                     // `swf` always writes an implicit end tag, let's cut that
                     // off. We scroll back 2 bytes before writing the actual
                     // datastream as it is guaranteed to at least be as long as
                     // the implicit end tag we want to get rid of.
-                    let correct_header_length = ba_write.bytes().len() - 2;
+                    let correct_header_length = ba_write.len() - 2;
                     ba_write.set_position(correct_header_length);
-                    ba_write.write_bytes(root.data());
+                    ba_write.write_bytes(root.data())?;
 
                     // `swf` wrote the wrong length (since we wrote the data
                     // ourselves), so we need to overwrite it ourselves.
                     ba_write.set_position(4);
                     ba_write.set_endian(Endian::Little);
-                    ba_write.write_unsigned_int((root.data().len() + correct_header_length) as u32);
+                    ba_write
+                        .write_unsigned_int((root.data().len() + correct_header_length) as u32)?;
 
                     // Finally, reset the array to the correct state.
                     ba_write.set_position(0);
@@ -320,6 +345,9 @@ pub fn loader_url<'gc>(
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => {
+                    return Err("Error: The stage's loader info does not have a loader URL".into())
+                }
                 LoaderStream::Swf(root, _) => {
                     let loader_url = root
                         .loader_url()
@@ -344,10 +372,15 @@ pub fn parameters<'gc>(
     if let Some(this) = this {
         if let Some(loader_stream) = this.as_loader_stream() {
             match &*loader_stream {
+                LoaderStream::Stage => {
+                    return Err("Error: The stage's loader info does not have parameters".into())
+                }
                 LoaderStream::Swf(root, _) => {
-                    let object_proto = activation.context.avm2.prototypes().object;
-                    let mut params_obj =
-                        ScriptObject::object(activation.context.gc_context, object_proto);
+                    let mut params_obj = activation
+                        .avm2()
+                        .classes()
+                        .object
+                        .construct(activation, &[])?;
                     let parameters = root.parameters();
 
                     for (k, v) in parameters.iter() {
@@ -370,90 +403,48 @@ pub fn parameters<'gc>(
     Ok(Value::Undefined)
 }
 
-/// Derive `LoaderInfoObject` impls.
-pub fn loaderinfo_deriver<'gc>(
-    base_proto: Object<'gc>,
-    activation: &mut Activation<'_, 'gc, '_>,
-    class: GcCell<'gc, Class<'gc>>,
-    scope: Option<GcCell<'gc, Scope<'gc>>>,
-) -> Result<Object<'gc>, Error> {
-    LoaderInfoObject::derive(base_proto, activation.context.gc_context, class, scope)
-}
-
 /// Construct `LoaderInfo`'s class.
 pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>> {
     let class = Class::new(
         QName::new(Namespace::package("flash.display"), "LoaderInfo"),
         Some(QName::new(Namespace::package("flash.events"), "EventDispatcher").into()),
-        Method::from_builtin(instance_init),
-        Method::from_builtin(class_init),
+        Method::from_builtin(instance_init, "<LoaderInfo instance initializer>", mc),
+        Method::from_builtin(class_init, "<LoaderInfo class initializer>", mc),
         mc,
     );
 
     let mut write = class.write(mc);
 
     write.set_attributes(ClassAttributes::SEALED);
+    write.set_instance_allocator(loaderinfo_allocator);
+    write.set_native_instance_init(Method::from_builtin(
+        native_instance_init,
+        "<LoaderInfo native instance initializer>",
+        mc,
+    ));
 
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "actionScriptVersion"),
-        Method::from_builtin(action_script_version),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "applicationDomain"),
-        Method::from_builtin(application_domain),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "bytesLoaded"),
-        Method::from_builtin(bytes_total),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "bytesTotal"),
-        Method::from_builtin(bytes_total),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "content"),
-        Method::from_builtin(content),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "contentType"),
-        Method::from_builtin(content_type),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "frameRate"),
-        Method::from_builtin(frame_rate),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "height"),
-        Method::from_builtin(height),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "isURLInaccessible"),
-        Method::from_builtin(is_url_inaccessible),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "swfVersion"),
-        Method::from_builtin(swf_version),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "url"),
-        Method::from_builtin(url),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "width"),
-        Method::from_builtin(width),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "bytes"),
-        Method::from_builtin(bytes),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "loaderUrl"),
-        Method::from_builtin(loader_url),
-    ));
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "parameters"),
-        Method::from_builtin(parameters),
-    ));
+    const PUBLIC_INSTANCE_PROPERTIES: &[(
+        &str,
+        Option<NativeMethodImpl>,
+        Option<NativeMethodImpl>,
+    )] = &[
+        ("actionScriptVersion", Some(action_script_version), None),
+        ("applicationDomain", Some(application_domain), None),
+        ("bytesLoaded", Some(bytes_total), None),
+        ("bytesTotal", Some(bytes_total), None),
+        ("content", Some(content), None),
+        ("contentType", Some(content_type), None),
+        ("frameRate", Some(frame_rate), None),
+        ("height", Some(height), None),
+        ("isURLInaccessible", Some(is_url_inaccessible), None),
+        ("swfVersion", Some(swf_version), None),
+        ("url", Some(url), None),
+        ("width", Some(width), None),
+        ("bytes", Some(bytes), None),
+        ("loaderUrl", Some(loader_url), None),
+        ("parameters", Some(parameters), None),
+    ];
+    write.define_public_builtin_instance_properties(mc, PUBLIC_INSTANCE_PROPERTIES);
 
     class
 }

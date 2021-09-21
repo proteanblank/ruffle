@@ -2,7 +2,6 @@
 
 use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
-use crate::avm1::function::Executable;
 use crate::avm1::object::script_object::TYPE_OF_OBJECT;
 use crate::avm1::object::search_prototype;
 use crate::avm1::property::Attribute;
@@ -25,7 +24,7 @@ pub struct SuperObject<'gc>(GcCell<'gc, SuperObjectData<'gc>>);
 #[collect(no_drop)]
 pub struct SuperObjectData<'gc> {
     /// The object present as `this` throughout the superchain.
-    child: Object<'gc>,
+    this: Object<'gc>,
 
     /// The `proto` that the currently-executing method was pulled from.
     base_proto: Object<'gc>,
@@ -34,68 +33,40 @@ pub struct SuperObjectData<'gc> {
 impl<'gc> SuperObject<'gc> {
     /// Construct a `super` for an incoming stack frame.
     ///
-    /// `this` and `base_proto` must be the values provided to
-    /// `Executable.exec`.
-    ///
-    /// NOTE: This function must not borrow any `GcCell` data as it is
-    /// sometimes called while mutable borrows are held on cells. Specifically,
-    /// `Object.call_setter` will panic if this function attempts to borrow
-    /// *any* objects.
-    pub fn from_this_and_base_proto(
+    /// `this` and `base_proto` must be the values provided to `Executable::exec`.
+    pub fn new(
+        activation: &mut Activation<'_, 'gc, '_>,
         this: Object<'gc>,
         base_proto: Object<'gc>,
-        activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Self, Error<'gc>> {
-        Ok(Self(GcCell::allocate(
+    ) -> Self {
+        Self(GcCell::allocate(
             activation.context.gc_context,
-            SuperObjectData {
-                child: this,
-                base_proto,
-            },
-        )))
-    }
-
-    /// Retrieve the prototype that `super` should be pulling from.
-    fn super_proto(self) -> Value<'gc> {
-        self.0.read().base_proto.proto()
-    }
-
-    /// Retrieve the constructor associated with the super proto.
-    fn super_constr(
-        self,
-        activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Result<Option<Object<'gc>>, Error<'gc>> {
-        if let Value::Object(super_proto) = self.super_proto() {
-            Ok(Some(
-                super_proto
-                    .get("__constructor__", activation)?
-                    .coerce_to_object(activation),
-            ))
-        } else {
-            Ok(None)
-        }
+            SuperObjectData { this, base_proto },
+        ))
     }
 }
 
 impl<'gc> TObject<'gc> for SuperObject<'gc> {
-    fn get_local(
+    fn get_local_stored(
         &self,
         _name: &str,
         _activation: &mut Activation<'_, 'gc, '_>,
-        _this: Object<'gc>,
-    ) -> Result<Value<'gc>, Error<'gc>> {
-        Ok(Value::Undefined)
+    ) -> Option<Value<'gc>> {
+        Some(Value::Undefined)
     }
 
-    fn set(
+    fn set_local(
         &self,
         _name: &str,
         _value: Value<'gc>,
         _activation: &mut Activation<'_, 'gc, '_>,
+        _this: Object<'gc>,
+        _base_proto: Option<Object<'gc>>,
     ) -> Result<(), Error<'gc>> {
         //TODO: What happens if you set `super.__proto__`?
         Ok(())
     }
+
     fn call(
         &self,
         name: &str,
@@ -104,12 +75,12 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
         _base_proto: Option<Object<'gc>>,
         args: &[Value<'gc>],
     ) -> Result<Value<'gc>, Error<'gc>> {
-        if let Some(constr) = self.super_constr(activation)? {
-            let super_proto = match self.super_proto() {
-                Value::Object(o) => Some(o),
-                _ => None,
-            };
-            constr.call(name, activation, self.0.read().child, super_proto, args)
+        if let Value::Object(proto) = self.proto(activation) {
+            let constructor = proto
+                .get("__constructor__", activation)?
+                .coerce_to_object(activation);
+            let this = self.0.read().this;
+            constructor.call(name, activation, this, Some(proto), args)
         } else {
             Ok(Value::Undefined)
         }
@@ -121,23 +92,23 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
         args: &[Value<'gc>],
         activation: &mut Activation<'_, 'gc, '_>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        let child = self.0.read().child;
-        let (method, base_proto) = search_prototype(self.super_proto(), name, activation, child)?;
+        let this = self.0.read().this;
+        let (method, base_proto) =
+            search_prototype(self.proto(activation), name, activation, this)?;
 
         if method.is_primitive() {
             avm_warn!(activation, "Super method {} is not callable", name);
         }
 
-        method.call(name, activation, child, base_proto, args)
+        method.call(name, activation, this, base_proto, args)
     }
 
-    fn call_setter(
-        &self,
-        name: &str,
-        value: Value<'gc>,
-        activation: &mut Activation<'_, 'gc, '_>,
-    ) -> Option<Object<'gc>> {
-        self.0.read().child.call_setter(name, value, activation)
+    fn getter(&self, name: &str, activation: &mut Activation<'_, 'gc, '_>) -> Option<Object<'gc>> {
+        self.0.read().this.getter(name, activation)
+    }
+
+    fn setter(&self, name: &str, activation: &mut Activation<'_, 'gc, '_>) -> Option<Object<'gc>> {
+        self.0.read().this.setter(name, activation)
     }
 
     fn create_bare_object(
@@ -145,12 +116,12 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
         activation: &mut Activation<'_, 'gc, '_>,
         this: Object<'gc>,
     ) -> Result<Object<'gc>, Error<'gc>> {
-        if let Value::Object(proto) = self.proto() {
+        if let Value::Object(proto) = self.proto(activation) {
             proto.create_bare_object(activation, this)
         } else {
             // TODO: What happens when you `new super` but there's no
             // super? Is this code even reachable?!
-            self.0.read().child.create_bare_object(activation, this)
+            self.0.read().this.create_bare_object(activation, this)
         }
     }
 
@@ -159,14 +130,8 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
         false
     }
 
-    fn proto(&self) -> Value<'gc> {
-        self.super_proto()
-    }
-
-    fn set_proto(&self, gc_context: MutationContext<'gc, '_>, prototype: Value<'gc>) {
-        if let Value::Object(prototype) = prototype {
-            self.0.write(gc_context).base_proto = prototype;
-        }
+    fn proto(&self, activation: &mut Activation<'_, 'gc, '_>) -> Value<'gc> {
+        self.0.read().base_proto.proto(activation)
     }
 
     fn define_value(
@@ -203,7 +168,6 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
     fn add_property_with_case(
         &self,
         _activation: &mut Activation<'_, 'gc, '_>,
-        _gc_context: MutationContext<'gc, '_>,
         _name: &str,
         _get: Object<'gc>,
         _set: Option<Object<'gc>>,
@@ -212,10 +176,22 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
         //`super` cannot have properties defined on it
     }
 
-    fn set_watcher(
+    fn call_watcher(
+        &self,
+        activation: &mut Activation<'_, 'gc, '_>,
+        name: &str,
+        value: &mut Value<'gc>,
+        this: Object<'gc>,
+    ) -> Result<(), Error<'gc>> {
+        self.0
+            .read()
+            .this
+            .call_watcher(activation, name, value, this)
+    }
+
+    fn watch(
         &self,
         _activation: &mut Activation<'_, 'gc, '_>,
-        _gc_context: MutationContext<'gc, '_>,
         _name: Cow<str>,
         _callback: Object<'gc>,
         _user_data: Value<'gc>,
@@ -223,68 +199,67 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
         //`super` cannot have properties defined on it
     }
 
-    fn remove_watcher(
-        &self,
-        _activation: &mut Activation<'_, 'gc, '_>,
-        _gc_context: MutationContext<'gc, '_>,
-        _name: Cow<str>,
-    ) -> bool {
+    fn unwatch(&self, _activation: &mut Activation<'_, 'gc, '_>, _name: Cow<str>) -> bool {
         //`super` cannot have properties defined on it
         false
     }
 
     fn has_property(&self, activation: &mut Activation<'_, 'gc, '_>, name: &str) -> bool {
-        self.0.read().child.has_property(activation, name)
+        self.0.read().this.has_property(activation, name)
     }
 
     fn has_own_property(&self, activation: &mut Activation<'_, 'gc, '_>, name: &str) -> bool {
-        self.0.read().child.has_own_property(activation, name)
+        self.0.read().this.has_own_property(activation, name)
     }
 
     fn has_own_virtual(&self, activation: &mut Activation<'_, 'gc, '_>, name: &str) -> bool {
-        self.0.read().child.has_own_virtual(activation, name)
+        self.0.read().this.has_own_virtual(activation, name)
     }
 
     fn is_property_enumerable(&self, activation: &mut Activation<'_, 'gc, '_>, name: &str) -> bool {
-        self.0.read().child.is_property_enumerable(activation, name)
+        self.0.read().this.is_property_enumerable(activation, name)
     }
 
     fn get_keys(&self, _activation: &mut Activation<'_, 'gc, '_>) -> Vec<String> {
         vec![]
     }
 
-    fn as_string(&self) -> Cow<str> {
-        Cow::Owned(self.0.read().child.as_string().into_owned())
-    }
-
     fn type_of(&self) -> &'static str {
         TYPE_OF_OBJECT
     }
 
-    fn length(&self) -> usize {
-        0
+    fn length(&self, _activation: &mut Activation<'_, 'gc, '_>) -> Result<i32, Error<'gc>> {
+        Ok(0)
     }
 
-    fn set_length(&self, _gc_context: MutationContext<'gc, '_>, _new_length: usize) {}
-
-    fn array(&self) -> Vec<Value<'gc>> {
-        vec![]
+    fn set_length(
+        &self,
+        _activation: &mut Activation<'_, 'gc, '_>,
+        _length: i32,
+    ) -> Result<(), Error<'gc>> {
+        Ok(())
     }
 
-    fn array_element(&self, _index: usize) -> Value<'gc> {
+    fn has_element(&self, _activation: &mut Activation<'_, 'gc, '_>, _index: i32) -> bool {
+        false
+    }
+
+    fn get_element(&self, _activation: &mut Activation<'_, 'gc, '_>, _index: i32) -> Value<'gc> {
         Value::Undefined
     }
 
-    fn set_array_element(
+    fn set_element(
         &self,
-        _index: usize,
+        _activation: &mut Activation<'_, 'gc, '_>,
+        _index: i32,
         _value: Value<'gc>,
-        _gc_context: MutationContext<'gc, '_>,
-    ) -> usize {
-        0
+    ) -> Result<(), Error<'gc>> {
+        Ok(())
     }
 
-    fn delete_array_element(&self, _index: usize, _gc_context: MutationContext<'gc, '_>) {}
+    fn delete_element(&self, _activation: &mut Activation<'_, 'gc, '_>, _index: i32) -> bool {
+        false
+    }
 
     fn interfaces(&self) -> Vec<Object<'gc>> {
         //`super` does not implement interfaces
@@ -305,14 +280,7 @@ impl<'gc> TObject<'gc> for SuperObject<'gc> {
 
     fn as_display_object(&self) -> Option<DisplayObject<'gc>> {
         //`super` actually can be used to invoke MovieClip methods
-        self.0.read().child.as_display_object()
-    }
-
-    fn as_executable(&self) -> Option<Executable<'gc>> {
-        //well, `super` *can* be called...
-        //...but `super_constr` needs an avm and context in order to get called.
-        //ergo, we can't downcast.
-        None
+        self.0.read().this.as_display_object()
     }
 
     fn as_ptr(&self) -> *const ObjectPtr {

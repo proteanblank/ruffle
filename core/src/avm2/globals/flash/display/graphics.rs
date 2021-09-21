@@ -2,16 +2,15 @@
 
 use crate::avm2::activation::Activation;
 use crate::avm2::class::{Class, ClassAttributes};
-use crate::avm2::method::Method;
+use crate::avm2::method::{Method, NativeMethodImpl};
 use crate::avm2::names::{Namespace, QName};
-use crate::avm2::object::{Object, TObject};
-use crate::avm2::traits::Trait;
+use crate::avm2::object::{stage_allocator, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::Error;
 use crate::display_object::TDisplayObject;
 use crate::shape_utils::DrawCommand;
 use gc_arena::{GcCell, MutationContext};
-use swf::{Color, FillStyle, LineCapStyle, LineJoinStyle, LineStyle, Twips};
+use swf::{Color, FillStyle, Fixed8, LineCapStyle, LineJoinStyle, LineStyle, Twips};
 
 /// Implements `flash.display.Graphics`'s instance constructor.
 pub fn instance_init<'gc>(
@@ -20,6 +19,19 @@ pub fn instance_init<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error> {
     Err("Graphics cannot be constructed directly.".into())
+}
+
+/// Implements `flash.display.Graphics`'s native instance constructor.
+pub fn native_instance_init<'gc>(
+    activation: &mut Activation<'_, 'gc, '_>,
+    this: Option<Object<'gc>>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error> {
+    if let Some(this) = this {
+        activation.super_init(this, &[])?;
+    }
+
+    Ok(Value::Undefined)
 }
 
 /// Implements `flash.display.Graphics`'s class constructor.
@@ -152,14 +164,14 @@ fn caps_to_cap_style<'gc>(
 fn joints_to_join_style<'gc>(
     activation: &mut Activation<'_, 'gc, '_>,
     joints: Value<'gc>,
-    miter_limit: f32,
+    miter_limit: f64,
 ) -> Result<LineJoinStyle, Error> {
     let joints_string = joints.coerce_to_string(activation);
     let joints_str = joints_string.as_deref();
 
     match (joints, joints_str) {
         (Value::Null, _) | (_, Ok("round")) => Ok(LineJoinStyle::Round),
-        (_, Ok("miter")) => Ok(LineJoinStyle::Miter(miter_limit)),
+        (_, Ok("miter")) => Ok(LineJoinStyle::Miter(Fixed8::from_f64(miter_limit))),
         (_, Ok("bevel")) => Ok(LineJoinStyle::Bevel),
         (_, Ok(_)) => Err("ArgumentError: joints is invalid".into()),
         (_, Err(_)) => Err(joints_string.unwrap_err()),
@@ -224,7 +236,7 @@ pub fn line_style<'gc>(
 
             let width = Twips::from_pixels(thickness.min(255.0).max(0.0));
             let color = color_from_args(color, alpha);
-            let join_style = joints_to_join_style(activation, joints, miter_limit as f32)?;
+            let join_style = joints_to_join_style(activation, joints, miter_limit)?;
             let (allow_scale_x, allow_scale_y) = scale_mode_to_allow_scale_bits(&scale_mode)?;
 
             let line_style = LineStyle {
@@ -357,47 +369,32 @@ pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>
     let class = Class::new(
         QName::new(Namespace::package("flash.display"), "Graphics"),
         Some(QName::new(Namespace::public(), "Object").into()),
-        Method::from_builtin(instance_init),
-        Method::from_builtin(class_init),
+        Method::from_builtin(instance_init, "<Graphics instance initializer>", mc),
+        Method::from_builtin(class_init, "<Graphics class initializer>", mc),
         mc,
     );
 
     let mut write = class.write(mc);
 
     write.set_attributes(ClassAttributes::SEALED);
+    write.set_instance_allocator(stage_allocator);
+    write.set_native_instance_init(Method::from_builtin(
+        native_instance_init,
+        "<Graphics native instance initializer>",
+        mc,
+    ));
 
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "beginFill"),
-        Method::from_builtin(begin_fill),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "clear"),
-        Method::from_builtin(clear),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "curveTo"),
-        Method::from_builtin(curve_to),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "endFill"),
-        Method::from_builtin(end_fill),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "lineStyle"),
-        Method::from_builtin(line_style),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "lineTo"),
-        Method::from_builtin(line_to),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "moveTo"),
-        Method::from_builtin(move_to),
-    ));
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "drawRect"),
-        Method::from_builtin(draw_rect),
-    ));
+    const PUBLIC_INSTANCE_METHODS: &[(&str, NativeMethodImpl)] = &[
+        ("beginFill", begin_fill),
+        ("clear", clear),
+        ("curveTo", curve_to),
+        ("endFill", end_fill),
+        ("lineStyle", line_style),
+        ("lineTo", line_to),
+        ("moveTo", move_to),
+        ("drawRect", draw_rect),
+    ];
+    write.define_public_builtin_instance_methods(mc, PUBLIC_INSTANCE_METHODS);
 
     class
 }

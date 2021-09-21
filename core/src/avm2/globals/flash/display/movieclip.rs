@@ -3,15 +3,13 @@
 use crate::avm2::activation::Activation;
 use crate::avm2::array::ArrayStorage;
 use crate::avm2::class::Class;
-use crate::avm2::globals::flash::display::{framelabel, scene};
-use crate::avm2::method::Method;
+use crate::avm2::method::{Method, NativeMethodImpl};
 use crate::avm2::names::{Namespace, QName};
 use crate::avm2::object::{ArrayObject, Object, TObject};
-use crate::avm2::string::AvmString;
-use crate::avm2::traits::Trait;
 use crate::avm2::value::Value;
 use crate::avm2::Error;
 use crate::display_object::{MovieClip, Scene, TDisplayObject};
+use crate::string::AvmString;
 use crate::tag_utils::{SwfMovie, SwfSlice};
 use gc_arena::{GcCell, MutationContext};
 use std::sync::Arc;
@@ -26,17 +24,14 @@ pub fn instance_init<'gc>(
         activation.super_init(this, &[])?;
 
         if this.as_display_object().is_none() {
-            let mut proto = this
-                .proto()
-                .ok_or("Attempted to construct bare-object MovieClip")?;
-            let constr = proto
-                .get_property(proto, &QName::dynamic_name("constructor"), activation)?
-                .coerce_to_object(activation)?;
+            let class_object = this
+                .instance_of()
+                .ok_or("Attempted to construct MovieClip on a bare object")?;
             let movie = Arc::new(SwfMovie::empty(activation.context.swf.version()));
             let new_do = MovieClip::new_with_avm2(
                 SwfSlice::empty(movie),
                 this,
-                constr,
+                class_object,
                 activation.context.gc_context,
             );
 
@@ -164,16 +159,15 @@ fn labels_for_scene<'gc>(
         start: scene_start,
         length: scene_length,
     } = scene;
-    let mut frame_labels = Vec::new();
-    let frame_label_proto = activation.context.avm2.prototypes().framelabel;
+    let frame_label_class = activation.context.avm2.classes().framelabel;
+    let labels = mc.labels_in_range(*scene_start, scene_start + scene_length);
+    let mut frame_labels = Vec::with_capacity(labels.len());
 
-    for (name, frame) in mc.labels_in_range(*scene_start, scene_start + scene_length) {
+    for (name, frame) in labels {
         let name: Value<'gc> = AvmString::new(activation.context.gc_context, name).into();
         let local_frame = frame - scene_start + 1;
         let args = [name, local_frame.into()];
-        let frame_label = frame_label_proto.construct(activation, &args)?;
-
-        framelabel::instance_init(activation, Some(frame_label), &args)?;
+        let frame_label = frame_label_class.construct(activation, &args)?;
 
         frame_labels.push(Some(frame_label.into()));
     }
@@ -181,11 +175,7 @@ fn labels_for_scene<'gc>(
     Ok((
         scene_name.to_string(),
         *scene_length,
-        ArrayObject::from_array(
-            ArrayStorage::from_storage(frame_labels),
-            activation.context.avm2.prototypes().array,
-            activation.context.gc_context,
-        ),
+        ArrayObject::from_storage(activation, ArrayStorage::from_storage(frame_labels))?,
     ))
 }
 
@@ -226,16 +216,14 @@ pub fn current_scene<'gc>(
             length: mc.total_frames(),
         });
         let (scene_name, scene_length, scene_labels) = labels_for_scene(activation, mc, &scene)?;
-        let scene_proto = activation.context.avm2.prototypes().scene;
+        let scene_class = activation.context.avm2.classes().scene;
         let args = [
             AvmString::new(activation.context.gc_context, scene_name).into(),
             scene_labels.into(),
             scene_length.into(),
         ];
 
-        let scene = scene_proto.construct(activation, &args)?;
-
-        scene::instance_init(activation, Some(scene), &args)?;
+        let scene = scene_class.construct(activation, &args)?;
 
         return Ok(scene.into());
     }
@@ -253,9 +241,7 @@ pub fn scenes<'gc>(
         .and_then(|o| o.as_display_object())
         .and_then(|dobj| dobj.as_movie_clip())
     {
-        let mut scene_objects = Vec::new();
         let mut mc_scenes = mc.scenes();
-
         if mc.scenes().is_empty() {
             mc_scenes.push(Scene {
                 name: "".to_string(),
@@ -264,28 +250,26 @@ pub fn scenes<'gc>(
             });
         }
 
+        let mut scene_objects = Vec::with_capacity(mc_scenes.len());
         for scene in mc_scenes {
             let (scene_name, scene_length, scene_labels) =
                 labels_for_scene(activation, mc, &scene)?;
-            let scene_proto = activation.context.avm2.prototypes().scene;
+            let scene_class = activation.context.avm2.classes().scene;
             let args = [
                 AvmString::new(activation.context.gc_context, scene_name).into(),
                 scene_labels.into(),
                 scene_length.into(),
             ];
 
-            let scene = scene_proto.construct(activation, &args)?;
-
-            scene::instance_init(activation, Some(scene), &args)?;
+            let scene = scene_class.construct(activation, &args)?;
 
             scene_objects.push(Some(scene.into()));
         }
 
-        return Ok(ArrayObject::from_array(
+        return Ok(ArrayObject::from_storage(
+            activation,
             ArrayStorage::from_storage(scene_objects),
-            activation.context.avm2.prototypes().array,
-            activation.context.gc_context,
-        )
+        )?
         .into());
     }
 
@@ -540,102 +524,42 @@ pub fn create_class<'gc>(mc: MutationContext<'gc, '_>) -> GcCell<'gc, Class<'gc>
     let class = Class::new(
         QName::new(Namespace::package("flash.display"), "MovieClip"),
         Some(QName::new(Namespace::package("flash.display"), "Sprite").into()),
-        Method::from_builtin(instance_init),
-        Method::from_builtin(class_init),
+        Method::from_builtin(instance_init, "<MovieClip instance initializer>", mc),
+        Method::from_builtin(class_init, "<MovieClip class initializer>", mc),
         mc,
     );
 
     let mut write = class.write(mc);
 
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "addFrameScript"),
-        Method::from_builtin(add_frame_script),
-    ));
+    const PUBLIC_INSTANCE_PROPERTIES: &[(
+        &str,
+        Option<NativeMethodImpl>,
+        Option<NativeMethodImpl>,
+    )] = &[
+        ("currentFrame", Some(current_frame), None),
+        ("currentFrameLabel", Some(current_frame_label), None),
+        ("currentLabel", Some(current_label), None),
+        ("currentLabels", Some(current_labels), None),
+        ("currentScene", Some(current_scene), None),
+        ("scenes", Some(scenes), None),
+        ("framesLoaded", Some(frames_loaded), None),
+        ("isPlaying", Some(is_playing), None),
+        ("totalFrames", Some(total_frames), None),
+    ];
+    write.define_public_builtin_instance_properties(mc, PUBLIC_INSTANCE_PROPERTIES);
 
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "currentFrame"),
-        Method::from_builtin(current_frame),
-    ));
-
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "currentFrameLabel"),
-        Method::from_builtin(current_frame_label),
-    ));
-
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "currentLabel"),
-        Method::from_builtin(current_label),
-    ));
-
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "currentLabels"),
-        Method::from_builtin(current_labels),
-    ));
-
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "currentScene"),
-        Method::from_builtin(current_scene),
-    ));
-
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "scenes"),
-        Method::from_builtin(scenes),
-    ));
-
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "framesLoaded"),
-        Method::from_builtin(frames_loaded),
-    ));
-
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "isPlaying"),
-        Method::from_builtin(is_playing),
-    ));
-
-    write.define_instance_trait(Trait::from_getter(
-        QName::new(Namespace::public(), "totalFrames"),
-        Method::from_builtin(total_frames),
-    ));
-
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "gotoAndPlay"),
-        Method::from_builtin(goto_and_play),
-    ));
-
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "gotoAndStop"),
-        Method::from_builtin(goto_and_stop),
-    ));
-
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "stop"),
-        Method::from_builtin(stop),
-    ));
-
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "play"),
-        Method::from_builtin(play),
-    ));
-
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "prevFrame"),
-        Method::from_builtin(prev_frame),
-    ));
-
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "nextFrame"),
-        Method::from_builtin(next_frame),
-    ));
-
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "prevScene"),
-        Method::from_builtin(prev_scene),
-    ));
-
-    write.define_instance_trait(Trait::from_method(
-        QName::new(Namespace::public(), "nextScene"),
-        Method::from_builtin(next_scene),
-    ));
+    const PUBLIC_INSTANCE_METHODS: &[(&str, NativeMethodImpl)] = &[
+        ("addFrameScript", add_frame_script),
+        ("gotoAndPlay", goto_and_play),
+        ("gotoAndStop", goto_and_stop),
+        ("stop", stop),
+        ("play", play),
+        ("prevFrame", prev_frame),
+        ("nextFrame", next_frame),
+        ("prevScene", prev_scene),
+        ("nextScene", next_scene),
+    ];
+    write.define_public_builtin_instance_methods(mc, PUBLIC_INSTANCE_METHODS);
 
     class
 }
