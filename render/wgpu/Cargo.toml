@@ -21,7 +21,7 @@ image = { version = "0.24.5", default-features = false }
 naga_oil = { git = "https://github.com/Aaron1011/naga_oil", rev = "f4474b53285a85fe67cc35372c9d7ff4517cb556", features = ["override_any"] }
 ouroboros = "0.15.5"
 typed-arena = "2.0.2"
-once_cell = "1.17.0"
+once_cell = "1.17.1"
 gc-arena = { workspace = true }
 naga-agal = { path = "../naga-agal" }
 downcast-rs = "1.2.0"
