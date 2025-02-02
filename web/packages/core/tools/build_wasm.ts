@@ -140,13 +140,6 @@ function buildWasm(
         });
     }
 }
-function copyStandIn(from: string, to: string) {
-    const suffixes = [`_bg.wasm`, `_bg.wasm.d.ts`, `.js`, `.d.ts`];
-    console.log(`Copying ${from} as a stand-in for ${to}...`);
-    for (const suffix of suffixes) {
-        copyFileSync(`dist/${from}${suffix}`, `dist/${to}${suffix}`);
-    }
-}
 function detectWasmOpt() {
     try {
         execFileSync("wasm-opt", ["--version"]);
@@ -167,15 +160,13 @@ if (wasmSource === "cargo_and_store") {
     rmSync("../../dist", { recursive: true, force: true });
     mkdirSync("../../dist");
 }
-buildWasm(
-    "web-wasm-extensions",
-    "ruffle_web-wasm_extensions",
-    hasWasmOpt,
-    true,
-    wasmSource,
-);
+buildWasm("web-wasm-extensions", "ruffle_web", hasWasmOpt, true, wasmSource);
 if (buildWasmMvp) {
-    buildWasm("web-vanilla-wasm", "ruffle_web", hasWasmOpt, false, wasmSource);
-} else {
-    copyStandIn("ruffle_web-wasm_extensions", "ruffle_web");
+    buildWasm(
+        "web-wasm-mvp",
+        "ruffle_web-wasm_mvp",
+        hasWasmOpt,
+        false,
+        wasmSource,
+    );
 }

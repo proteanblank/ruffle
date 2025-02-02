@@ -163,7 +163,7 @@ impl TextFormat {
         let align = et.layout().map(|l| l.align);
         let left_margin = et.layout().map(|l| l.left_margin.to_pixels());
         let right_margin = et.layout().map(|l| l.right_margin.to_pixels());
-        let indent = et.layout().map(|l| l.indent.to_pixels());
+        let indent = et.layout().map(|l| l.indent.to_pixels().round_ties_even());
         let leading = et.layout().map(|l| l.leading.to_pixels());
 
         // TODO: Text fields that don't specify a font are assumed to be 12px
@@ -867,8 +867,8 @@ impl FormatSpans {
                         tag @ b"li" => {
                             format = apply_style(style_sheet, format, WStr::from_units(tag));
 
-                            let is_last_nl = text.iter().last() == Some(HTML_NEWLINE);
-                            if is_multiline && !is_last_nl && text.len() > 0 {
+                            let is_last_nl = text.iter().next_back() == Some(HTML_NEWLINE);
+                            if is_multiline && !is_last_nl && !text.is_empty() {
                                 // If the last paragraph was not closed and
                                 // there was some text since then,
                                 // we need to close it here.

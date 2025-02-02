@@ -257,7 +257,7 @@ impl MainWindow {
         // do not resize while window is maximized.
         let should_resize = !self.gui.window().is_maximized();
 
-        let viewport_size = if should_resize {
+        let (viewport_size, state) = if should_resize {
             let movie_width = swf_header.stage_size().width().to_pixels();
             let movie_height = swf_header.stage_size().height().to_pixels();
 
@@ -312,16 +312,18 @@ impl MainWindow {
             // On X11 (and possibly other platforms), the window size is not updated immediately.
             // On a successful resize request, wait for the window to be resized to the requested size
             // before we start running the SWF (which can observe the viewport size in "noScale" mode)
-            if !window_resize_denied && window_size != viewport_size.into() {
-                self.loaded = LoadingState::WaitingForResize;
+            let state = if !window_resize_denied && window_size != viewport_size.into() {
+                LoadingState::WaitingForResize
             } else {
-                self.loaded = LoadingState::Loaded;
-            }
+                LoadingState::Loaded
+            };
 
-            viewport_size
+            (viewport_size, state)
         } else {
-            self.gui.window().inner_size()
+            (self.gui.window().inner_size(), LoadingState::Loaded)
         };
+
+        self.loaded = state;
 
         self.gui.window().set_fullscreen(if self.start_fullscreen {
             Some(Fullscreen::Borderless(None))
@@ -366,11 +368,11 @@ impl MainWindow {
         // We should look at changing our tick to happen somewhere else if we see any behavioural problems.
         if matches!(self.loaded, LoadingState::Loaded) {
             let new_time = Instant::now();
-            let dt = new_time.duration_since(self.time).as_micros();
+            let dt = new_time.duration_since(self.time).as_nanos();
             if dt > 0 {
                 self.time = new_time;
                 if let Some(mut player) = self.player.get() {
-                    player.tick(dt as f64 / 1000.0);
+                    player.tick(dt as f64 / 1_000_000.0);
                     self.next_frame_time = Some(new_time + player.time_til_next_frame());
                 } else {
                     self.next_frame_time = None;
@@ -439,11 +441,17 @@ impl ApplicationHandler<RuffleEvent> for App {
             let preferred_height = self.preferences.cli.height;
             let start_fullscreen = self.preferences.cli.fullscreen;
 
-            let window_attributes = WindowAttributes::default()
+            let mut window_attributes = WindowAttributes::default()
                 .with_visible(false)
                 .with_title("Ruffle")
                 .with_window_icon(Some(icon))
                 .with_min_inner_size(min_window_size);
+
+            #[cfg(target_os = "linux")]
+            {
+                use winit::platform::wayland::WindowAttributesExtWayland;
+                window_attributes = window_attributes.with_name("rs.ruffle.Ruffle", "main");
+            }
 
             let event_loop_proxy = self.event_loop_proxy.clone();
             let preferences = self.preferences.clone();

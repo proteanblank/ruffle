@@ -857,6 +857,7 @@ impl<'a, 'gc> LayoutContext<'a, 'gc> {
         } else {
             Twips::from_pixels(span.left_margin + span.block_indent)
         }
+        .max(Twips::ZERO)
     }
 
     /// Calculate the left-align offset of a given line of text given the span
@@ -1392,11 +1393,11 @@ impl<'gc> LayoutBox<'gc> {
             LayoutContent::Text {
                 text_format: TextFormat { url: Some(url), .. },
                 ..
-            } => url.len() > 0,
+            } => !url.is_empty(),
             LayoutContent::Bullet {
                 text_format: TextFormat { url: Some(url), .. },
                 ..
-            } => url.len() > 0,
+            } => !url.is_empty(),
             _ => false,
         }
     }

@@ -363,6 +363,12 @@ struct FontData {
     descriptor: FontDescriptor,
 
     font_type: FontType,
+
+    /// Whether this font has a layout defined.
+    ///
+    /// Fonts without a layout are used only to describe a font,
+    /// not to provide glyphs.
+    has_layout: bool,
 }
 
 impl<'gc> Font<'gc> {
@@ -385,6 +391,7 @@ impl<'gc> Font<'gc> {
                 glyphs: GlyphSource::FontFace(face),
                 descriptor,
                 font_type,
+                has_layout: true,
             },
         )))
     }
@@ -463,6 +470,7 @@ impl<'gc> Font<'gc> {
                 leading,
                 descriptor,
                 font_type,
+                has_layout: tag.layout.is_some(),
             },
         ))
     }
@@ -513,6 +521,7 @@ impl<'gc> Font<'gc> {
                 glyphs: GlyphSource::Empty,
                 descriptor,
                 font_type,
+                has_layout: true,
             },
         ))
     }
@@ -714,12 +723,14 @@ impl<'gc> Font<'gc> {
 
                 let cur_slice = &text[word_start..];
                 let mut char_iter = cur_slice.char_indices();
-                let mut prev_char_index = word_start;
+                let mut char_index = word_start;
+                let mut prev_char_index = char_index;
                 let mut prev_frag_end = 0;
 
                 char_iter.next(); // No need to check cur_slice[0..0]
-                while last_passing_breakpoint < remaining_width {
-                    prev_char_index = word_start + prev_frag_end;
+                while last_passing_breakpoint <= remaining_width {
+                    prev_char_index = char_index;
+                    char_index = word_start + prev_frag_end;
 
                     if let Some((frag_end, _)) = char_iter.next() {
                         last_passing_breakpoint = self.measure(&cur_slice[..frag_end], params);
@@ -758,6 +769,10 @@ impl<'gc> Font<'gc> {
 
     pub fn font_type(&self) -> FontType {
         self.0.font_type
+    }
+
+    pub fn has_layout(&self) -> bool {
+        self.0.has_layout
     }
 }
 
